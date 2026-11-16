@@ -1,0 +1,48 @@
+{
+  "version": "3.3",
+  "review": {
+    "minicpm_text_quality_threshold": 0.82,
+    "deterministic_candidate_confidence_threshold": 0.88,
+    "max_candidates_per_field": 8,
+    "global_candidates_per_field": 5
+  },
+  "pipeline": {
+    "fields_only": true,
+    "python_only_writer": true
+  },
+  "same_page_pairs": [
+    ["protocollo", "data_protocollo"],
+    ["odonimo", "civico"],
+    ["particella", "subalterno"],
+    ["data_valutazione", "esito_valutazione"]
+  ],
+  "profiles": {
+    "protocol": {"fields": ["protocollo", "data_protocollo"], "allowed_roles": ["PROTOCOLLO_PRATICA", "PROTOCOLLO_RICHIAMATO", "PROTOCOLLO_ALLEGATO"], "selection_instruction": "Scegli protocollo e data come coppia della stessa occorrenza e pagina. Non scegliere letture contenenti simboli OCR anomali quando esiste una lettura integra e contestualmente coerente. Non confondere protocolli di allegati con quello della pratica."},
+    "identity": {"fields": ["richiedente"], "allowed_roles": ["RICHIEDENTE", "TECNICO", "SCONOSCIUTO"], "selection_instruction": "Riconosci il committente o richiedente della pratica, persona fisica o giuridica. Il documento può essere materialmente presentato da un tecnico: non scegliere tecnico, progettista, direttore lavori, impresa esecutrice o funzionario quando è indicato un committente, proprietario, titolare o richiedente."},
+    "address": {"fields": ["comune", "odonimo", "civico"], "allowed_roles": ["IMMOBILE_RICHIESTA", "RICHIEDENTE_RESIDENZA", "TECNICO", "PAGAMENTO", "SCONOSCIUTO"], "selection_instruction": "Scegli esclusivamente comune, odonimo e civico dell'immobile oggetto della richiesta. Escludi sempre residenza o sede del richiedente e indirizzi di tecnico, impresa, pagamento o ufficio. Odonimo e civico devono appartenere alla stessa occorrenza. Se l'ubicazione dell'immobile non contiene un civico, scegli comune e odonimo corretti e lascia civico null: non sostituirlo con altri numeri del documento."},
+    "cadastre": {"fields": ["foglio", "particella", "subalterno", "categoria_catastale"], "allowed_roles": ["DATI_CATASTALI_IMMOBILE", "SCONOSCIUTO"]},
+    "evaluation": {"fields": ["data_valutazione", "esito_valutazione"], "allowed_roles": ["VALUTAZIONE_FINALE", "SCONOSCIUTO"], "selection_instruction": "Scegli una sola coppia data-esito dello stesso evento. La data_valutazione e la data dell'atto che contiene la valutazione: escludi date di presentazione della domanda, date richiamate e date degli allegati. L'esito ammesso e solo POSITIVO o NEGATIVO."},
+    "summary": {"fields": ["sintesi"], "allowed_roles": ["SINTESI_FASCICOLO"], "selection_instruction": "La sintesi viene composta deterministicamente da Python: non selezionare o generare testo."}
+  },
+  "relationships": [
+    ["protocollo", "data_protocollo", "protocollo_ha_data"],
+    ["odonimo", "civico", "odonimo_ha_civico"],
+    ["particella", "subalterno", "particella_ha_subalterno"],
+    ["data_valutazione", "esito_valutazione", "valutazione_ha_esito"]
+  ],
+  "fields": {
+    "protocollo": {"label": "Protocollo", "profile": "protocol", "keywords": ["protocollo", "prot."], "pattern": "(?:protocollo|prot(?:\\.(?:tlo|llo)?)?)\\s*:?\\s*(?:n(?:\\.|°)?|numero)\\s*(?P<value>[^\\s,;]{2,30})"},
+    "data_protocollo": {"label": "Data protocollo", "profile": "protocol", "keywords": ["protocollo", "prot."], "pattern": "(?:protocollo|prot\\.)[^\\n]{0,60}?(?P<value>\\d{1,2}[./-]\\d{1,2}[./-]\\d{2,4})"},
+    "richiedente": {"label": "Richiedente", "profile": "identity", "keywords": ["richiedente", "il sottoscritto", "istanza", "committente"], "pattern": "(?:richiedente|il sottoscritto|committente)\\s*:?[ ]*(?P<value>[A-ZÀ-Ü][A-Za-zÀ-ÿ' .&-]{2,70})"},
+    "comune": {"label": "Comune", "profile": "address", "keywords": ["comune di", "municipio di", "città di"], "pattern": "(?:comune|municipio|città)\\s+di\\s+(?P<value>[A-ZÀ-Ü][A-Za-zÀ-ÿ '\\-]{2,80})"},
+    "odonimo": {"label": "Odonimo", "profile": "address", "keywords": ["via", "viale", "piazza", "contrada", "località", "ubicazione"], "pattern": "(?P<value>(?:via|viale|piazza|strada|contrada|località)\\s+[A-ZÀ-Ü][A-Za-zÀ-ÿ '\\-]{2,60}?)(?=\\s+(?:n\\.|civico)\\s*\\d|[,;]|$)"},
+    "civico": {"label": "Civico", "profile": "address", "keywords": ["civico", "n.", "n.c.", "ubicazione"], "pattern": "(?:civico|n\\.(?:\\s*c\\.)?)\\s*(?P<value>\\d+[A-Z]?(?:[/ -][A-Z0-9]+)?)"},
+    "foglio": {"label": "Foglio", "profile": "cadastre", "keywords": ["foglio", "fg."], "pattern": "(?:foglio|fog\\.|fg\\.)\\s*(?:n\\.)?\\s*(?P<value>\\d+(?:\\s*,\\s*\\d+)*)"},
+    "particella": {"label": "Particella", "profile": "cadastre", "keywords": ["particella", "mappale", "p.lla"], "pattern": "(?:particella|part\\.|p\\.lla|mappale)\\s*(?:n\\.)?\\s*(?P<value>\\d+(?:\\s*,\\s*\\d+)*)"},
+    "subalterno": {"label": "Subalterno", "profile": "cadastre", "keywords": ["subalterno", "sub."], "pattern": "(?:subalterno|subalt\\.|sub\\.)\\s*(?P<value>\\d+(?:[.,]\\d+)?)"},
+    "categoria_catastale": {"label": "Categoria catastale", "profile": "cadastre", "keywords": ["categoria catastale", "categoria", "cat."], "pattern": "(?:categoria(?: catastale)?|categ\\.|cat\\.)\\s*(?P<value>[A-Z]/\\d{2})"},
+    "data_valutazione": {"label": "Data valutazione", "profile": "evaluation", "keywords": ["approvato", "respinto", "deliberazione", "parere", "esame istruttorio", "proposta progettuale", "comunicazione interlocutoria"], "pattern": "(?:deliberazione|parere|approvato|respinto)[^\\n]{0,80}?(?P<value>\\d{1,2}[./-]\\d{1,2}[./-]\\d{2,4})"},
+    "esito_valutazione": {"label": "Esito valutazione", "profile": "evaluation", "keywords": ["approvato", "respinto", "favorevole", "contrario", "esame istruttorio", "proposta progettuale", "comunicazione interlocutoria"], "pattern": "(?P<value>approvata?|respinta?|favorevole|contrario|positiva?|negativa?)"},
+    "sintesi": {"label": "Sintesi", "profile": "summary", "keywords": [], "pattern": null, "summary_fields": ["richiedente", "comune", "odonimo", "civico", "protocollo"], "max_length": 100}
+  }
+}

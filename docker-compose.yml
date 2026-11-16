@@ -1,0 +1,42 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: document_ai
+      POSTGRES_USER: document_ai
+      POSTGRES_PASSWORD: document_ai
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U document_ai"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      DOC_AI_DATABASE_URL: postgresql+psycopg://document_ai:document_ai@postgres:5432/document_ai
+      DOC_AI_STORAGE_DIR: /data/storage
+      DOC_AI_INSTRUCTIONS_PATH: /app/docs/ISTRUZIONI GLOBALI.md
+      DOC_AI_PIPELINE_RULES_PATH: /app/docs/instructions/pipeline_rules.json
+      DOC_AI_MODEL_BACKEND: mlx
+      DOC_AI_MODEL_ENDPOINT: http://host.docker.internal:8081
+      DOC_AI_MODEL_NAME: ${DOC_AI_MODEL_NAME:-mlx-community/Qwen3-4B-Instruct-2507-4bit}
+      DOC_AI_MINICPM_ENDPOINT: http://host.docker.internal:18499
+      DOC_AI_MINICPM_MODEL_NAME: minicpm-ocr
+      DOC_AI_MINICPM_LAYOUT_PROVIDER: ${DOC_AI_MINICPM_LAYOUT_PROVIDER:-ppdoclayout3_torch}
+      DOC_AI_MINICPM_LAYOUT_MODEL_DIR: ${DOC_AI_MINICPM_LAYOUT_MODEL_DIR:-/data/storage/models/PP-DocLayoutV3_safetensors}
+      DOC_AI_MINICPM_LAYOUT_THRESHOLD: ${DOC_AI_MINICPM_LAYOUT_THRESHOLD:-0.3}
+      DOC_AI_CORS_ORIGINS: http://localhost:5174,http://localhost:3000
+    volumes: [document_storage:/data/storage]
+    depends_on:
+      postgres: {condition: service_healthy}
+    ports: ["8000:8000"]
+  frontend:
+    build: ./frontend
+    depends_on: [backend]
+    ports: ["5174:80"]
+volumes:
+  postgres_data:
+  document_storage:
