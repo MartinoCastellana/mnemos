@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     model_backend: Literal["mlx"] = "mlx"
     model_endpoint: str = "http://localhost:8081"
     model_name: str = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
+    model_supervisor_endpoint: str = "http://host.docker.internal:18500"
+    model_supervisor_token: str = ""
     minicpm_endpoint: str = "http://localhost:18499"
     minicpm_model_name: str = "minicpm-ocr"
     minicpm_layout_provider: str = "ppdoclayout3_torch"
@@ -25,7 +27,7 @@ class Settings(BaseSettings):
     minicpm_sleep_idle_seconds: int = 30
     minicpm_standby_timeout_sec: int = 90
     minicpm_render_dpi: int = 120
-    minicpm_max_tokens: int = 8192
+    minicpm_max_tokens: int = 4096
     instructions_path: Path = Path("../docs/ISTRUZIONI GLOBALI.md")
     pipeline_rules_path: Path = Path("../docs/instructions/pipeline_rules.json")
     max_upload_mb: int = 150

@@ -11,7 +11,6 @@ export const FIELD_DEFINITIONS = [
   { key: "categoria_catastale", label: "Categoria catastale" },
   { key: "data_valutazione", label: "Data valutazione" },
   { key: "esito_valutazione", label: "Esito valutazione" },
-  { key: "sintesi", label: "Sintesi" },
 ] as const;
 
 const labels = new Map<string, string>(FIELD_DEFINITIONS.map((field) => [field.key, field.label]));

@@ -816,7 +816,11 @@ def optimized_document_file(document_id: str, db: Session = Depends(get_db)):
 
 @router.get("/fields", response_model=list[FieldDefinitionOut])
 def list_fields(db: Session = Depends(get_db)):
-    return list(db.scalars(select(FieldDefinition).order_by(FieldDefinition.id)))
+    return list(db.scalars(
+        select(FieldDefinition)
+        .where(FieldDefinition.key != "sintesi")
+        .order_by(FieldDefinition.id)
+    ))
 
 
 @router.put("/fields", response_model=list[FieldDefinitionOut])

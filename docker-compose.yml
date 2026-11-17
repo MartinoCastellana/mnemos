@@ -23,6 +23,8 @@ services:
       DOC_AI_MODEL_BACKEND: mlx
       DOC_AI_MODEL_ENDPOINT: http://host.docker.internal:8081
       DOC_AI_MODEL_NAME: ${DOC_AI_MODEL_NAME:-mlx-community/Qwen3-4B-Instruct-2507-4bit}
+      DOC_AI_MODEL_SUPERVISOR_ENDPOINT: http://host.docker.internal:18500
+      DOC_AI_MODEL_SUPERVISOR_TOKEN: ${DOC_AI_MODEL_SUPERVISOR_TOKEN:-}
       DOC_AI_MINICPM_ENDPOINT: http://host.docker.internal:18499
       DOC_AI_MINICPM_MODEL_NAME: minicpm-ocr
       DOC_AI_MINICPM_LAYOUT_PROVIDER: ${DOC_AI_MINICPM_LAYOUT_PROVIDER:-ppdoclayout3_torch}

@@ -8,8 +8,10 @@ const labels: Record<string, string> = {
   OPTIMIZATION: "Ottimizzazione PDF",
   PIPELINE: "Avvio pipeline",
   MODEL_HEALTH: "Verifica modello",
+  MODEL_SWITCH: "Cambio modello",
   OCR: "OCR pagina",
   PAGE_CHECKPOINT: "Analisi pagina",
+  SELECTOR: "Selezione Python",
   STRUCTURE: "Struttura documento",
   PLANNING: "Pianificazione",
   EXTRACTION: "Estrazione campi",
@@ -46,13 +48,17 @@ const narration = (event: Audit) => {
   if (event.stage === "OPTIMIZATION")
     return "Creo il PDF di lavoro ottimizzato e normalizzo la rotazione delle pagine.";
   if (event.stage === "MODEL_HEALTH")
-    return "Verifico che il modello sia disponibile prima di affidargli una revisione.";
+    return `Verifico ${detail.model === "qwen" ? "Qwen per la selezione globale" : "MiniCPM per l’OCR"}.`;
+  if (event.stage === "MODEL_SWITCH")
+    return `${detail.model === "qwen" ? "Qwen" : "MiniCPM"} scaricato dalla memoria.`;
   if (event.stage === "OCR")
     return `MiniCPM-OCR legge il PDF di lavoro${detail.page ? `, pagina ${detail.page}` : ""}.`;
   if (event.stage === "PAGE_CHECKPOINT")
     return `Consolido la Micro-Memory${detail.page ? ` della pagina ${detail.page}` : ""}: candidati, contesto e confidence.`;
+  if (event.stage === "SELECTOR")
+    return "Python sceglie il valore estratto più volte; a parità usa la confidence semantica e poi quella OCR.";
   if (event.stage === "GLOBAL_PASS")
-    return "Qwen sceglie tra i candidati della memoria globale; Python valida e scrive i risultati.";
+    return "Python valida le scelte di Qwen, applica le regole dei campi e scrive i risultati finali.";
   if (event.stage === "RESET")
     return "Rimuovo i risultati precedenti mantenendo PDF e OCR disponibili.";
   if (event.stage === "INTERRUPT") return "Interrompo la run al checkpoint sicuro raggiunto.";
@@ -67,10 +73,14 @@ const engines = (event: Audit) => {
     "OCR",
     "PAGE_CHECKPOINT",
     "GLOBAL_PASS",
+    "SELECTOR",
     "RESET",
     "MANUAL_EDIT",
   ].includes(event.stage);
-  const localModel = event.stage === "GLOBAL_PASS";
+  const modelName = String(event.detail?.model ?? "");
+  const localModel = event.stage === "OCR" || event.stage === "SELECTOR" ||
+    ["MODEL_HEALTH", "MODEL_SWITCH"].includes(event.stage) &&
+      ["minicpm", "qwen"].includes(modelName);
   const pythonTask =
     event.stage === "OCR"
       ? "Python ha eseguito MiniCPM-OCR sul PDF di lavoro."
@@ -85,10 +95,10 @@ const engines = (event: Audit) => {
             : event.stage === "MANUAL_EDIT"
               ? "Python ha registrato la correzione manuale."
               : "Python ha orchestrato e preparato la pipeline deterministica.";
-  const localModelTask =
-    event.stage === "GLOBAL_PASS"
-      ? "Il modello locale ha selezionato i candidati secondo le regole della pipeline."
-      : "Qwen locale ha selezionato i candidati dalla memoria globale.";
+  const localModelTask = event.stage === "OCR" || modelName === "minicpm"
+    ? "MiniCPM-OCR legge le pagine e viene scaricato prima di avviare Qwen."
+    : "Qwen seleziona gli ID dei candidati; Python valida le scelte e scrive i campi.";
+  const localModelLabel = event.stage === "OCR" || modelName === "minicpm" ? "MiniCPM" : "Qwen";
   return (
     <span className="engine-badges">
       {python && (
@@ -99,7 +109,7 @@ const engines = (event: Audit) => {
       )}
       {localModel && (
         <i className="engine model" data-tooltip={localModelTask} aria-label={localModelTask}>
-          MLX
+          {localModelLabel}
         </i>
       )}
     </span>

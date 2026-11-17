@@ -959,6 +959,7 @@ main {
 }
 .workspace-three {
   display: grid;
+  grid-template-areas: "pipeline viewer fields";
   grid-template-columns: minmax(300px, 1fr) minmax(450px, 1.95fr) minmax(260px, 0.92fr);
   grid-template-rows: minmax(0, 1fr);
   width: 100%;
@@ -981,16 +982,13 @@ main {
   border-right: 1px solid #e2e8e7;
 }
 .workspace-three > .pipeline-log {
-  grid-column: 1;
-  grid-row: 1;
+  grid-area: pipeline;
 }
 .center-column {
-  grid-column: 2;
-  grid-row: 1;
+  grid-area: viewer;
 }
 .fields-column {
-  grid-column: 3;
-  grid-row: 1;
+  grid-area: fields;
   border-right: 0;
 }
 .fields-column {
@@ -1960,15 +1958,13 @@ main {
   }
   .workspace-three {
     grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: auto;
+    grid-template-areas:
+      "viewer"
+      "pipeline"
+      "fields";
+    grid-template-rows: auto auto auto;
     height: auto;
     overflow: visible;
-  }
-  .fields-column,
-  .center-column,
-  .workspace-three > .pipeline-log {
-    grid-column: auto;
-    grid-row: auto;
   }
   .fields-column,
   .center-column,
@@ -1977,15 +1973,6 @@ main {
     min-height: 420px;
     border-right: 0;
     border-bottom: 1px solid #e2e8e7;
-  }
-  .center-column {
-    order: -1;
-  }
-  .workspace-three > .pipeline-log {
-    order: 1;
-  }
-  .fields-column {
-    order: 2;
   }
   .center-column .viewer-content {
     min-height: 0;

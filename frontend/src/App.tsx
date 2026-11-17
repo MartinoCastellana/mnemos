@@ -152,7 +152,7 @@ export default function App() {
   }, [runStartedAt, completedAt, isProcessing]);
   useEffect(() => {
     api.fields()
-      .then((items) => setFields(items.filter((field) => field.enabled)))
+      .then((items) => setFields(items.filter((field) => field.enabled && field.key !== "sintesi")))
       .catch((reason) => setError(String(reason)));
   }, []);
   useEffect(() => {
@@ -182,6 +182,12 @@ export default function App() {
       const result = resultByKey.get(field.key);
       return !result || !result.value?.trim();
     });
+  }, [detail?.results, fields]);
+  const orderedFieldRows = useMemo(() => {
+    const resultByKey = new Map((detail?.results ?? []).map((result) => [result.field_key, result]));
+    return [...fields]
+      .sort((a, b) => fieldOrder(a.key, fields) - fieldOrder(b.key, fields))
+      .map((field) => ({ field, result: resultByKey.get(field.key) }));
   }, [detail?.results, fields]);
   const hasExtractedData = orderedResults.some((result) => Boolean(result.value?.trim())) ||
     (memory?.candidates.length ?? 0) > 0;
@@ -537,7 +543,7 @@ export default function App() {
                   <ScanText />
                   <h2>Campi estratti</h2>
                 </div>
-                <span>{fields.length}</span>
+                <span title={`${pendingFields.length} in attesa`}>{fields.length} · {pendingFields.length} in attesa</span>
               </div>
               <div className="fields-scroll">
                 {showAnalysisPrompt ? (
@@ -546,56 +552,18 @@ export default function App() {
                     <strong>Nessun dato disponibile</strong>
                     <span>Avvia un’analisi del fascicolo per estrarre campi e contenuti.</span>
                   </div>
-                ) : pendingFields.length > 0 && (
-                  <section className="pending-fields" aria-label="Campi in attesa">
-                    <div className="pending-heading">
-                      <span>In attesa</span>
-                      <small>{pendingFields.length}</small>
-                    </div>
-                    {pendingFields.map((field) => (
-                      <div
-                        className={`pending-field${selectedFieldKey === field.key ? " active" : ""}`}
-                        key={field.key}
-                      >
-                        <button
-                          type="button"
-                          className="pending-field-select"
-                          onClick={() => chooseField(field.key)}
-                        >
-                          <small>{field.label}</small>
-                          <strong className={valueChosenByAI(field.key) ? "has-ai-value" : ""}>
-                            {valueChosenByAI(field.key) ||
-                              (isProcessing ? "In attesa della selezione AI" : "Nessun valore")}
-                          </strong>
-                        </button>
-                        <div className="pending-field-actions">
-                          <button
-                            type="button"
-                            className="candidate-count-button"
-                            disabled={!candidatesByField.get(field.key)?.length}
-                            onClick={() => {
-                              chooseField(field.key);
-                              setCandidateField(field);
-                            }}
-                          >
-                            {candidatesByField.get(field.key)?.length ?? 0} candidati
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-                  </section>
-                )}
-                {!showAnalysisPrompt && orderedResults.length ? (
+                ) : null}
+                {!showAnalysisPrompt && orderedFieldRows.length ? (
                   <div className="results-list">
-                    {orderedResults.map((result, index) => (
+                    {orderedFieldRows.map(({ field, result }, index) => result ? (
                     <div
-                      key={result.field_key}
-                      className={`result${result.field_key === selectedFieldKey ? " active" : ""}${result.confidence < 0.9 ? " low-confidence" : ""}`}
+                      key={field.key}
+                      className={`result${field.key === selectedFieldKey ? " active" : ""}${result.confidence < 0.9 ? " low-confidence" : ""}`}
                       onClick={() => chooseResult(result)}
                     >
                       <div>
-                        <small>{fieldLabel(result.field_key, fields)}</small>
-                        {result.field_key === "sintesi" ? (
+                        <small>{field.label}</small>
+                        {field.key === "sintesi" ? (
                           <textarea
                             key={`${result.field_key}:${result.value ?? ""}`}
                             className="result-value-input summary-value"
@@ -627,9 +595,8 @@ export default function App() {
                           />
                         )}
                         {(() => {
-                          const field = fields.find((item) => item.key === result.field_key);
-                          const count = candidatesByField.get(result.field_key)?.length ?? 0;
-                          return field ? (
+                          const count = candidatesByField.get(field.key)?.length ?? 0;
+                          return (
                             <button
                               type="button"
                               className="candidate-count-button"
@@ -641,7 +608,7 @@ export default function App() {
                             >
                               {count} candidati
                             </button>
-                          ) : null;
+                          );
                         })()}
                       </div>
                       <span className="score" title="Confidenza globale">
@@ -652,6 +619,26 @@ export default function App() {
                         {result.page_number ? `Pag. ${result.page_number}` : "Pagina n/d"} · #{index + 1}
                       </em>
                     </div>
+                    ) : (
+                      <div
+                        className={`pending-field${field.key === selectedFieldKey ? " active" : ""}`}
+                        key={field.key}
+                      >
+                        <button type="button" className="pending-field-select" onClick={() => chooseField(field.key)}>
+                          <small>{field.label}</small>
+                          <strong className={valueChosenByAI(field.key) ? "has-ai-value" : ""}>
+                            {valueChosenByAI(field.key) || (isProcessing ? "In attesa della selezione AI" : "Nessun valore")}
+                          </strong>
+                        </button>
+                        <button
+                          type="button"
+                          className="candidate-count-button"
+                          disabled={!candidatesByField.get(field.key)?.length}
+                          onClick={() => { chooseField(field.key); setCandidateField(field); }}
+                        >
+                          {candidatesByField.get(field.key)?.length ?? 0} candidati
+                        </button>
+                      </div>
                     ))}
                   </div>
                 ) : pendingFields.length === 0 ? (

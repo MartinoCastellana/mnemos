@@ -31,6 +31,7 @@ from app.db.models import (
 from app.services.deterministic_memory import DeterministicMicroMemoryEngine
 from app.services.extraction import EvidenceConsensusEngine, LocalizationEngine, ModelGateway
 from app.services.memory import OCRBlock, PageMemory
+from app.services.model_supervisor import ModelSupervisor
 from app.services.ocr import MiniCPMOCRService, load_pdf_page, optimize_pdf
 
 
@@ -48,6 +49,7 @@ class AgentOrchestrator:
     def __init__(self):
         self.settings = get_settings()
         self.gateway = ModelGateway(self.settings)
+        self.model_supervisor = ModelSupervisor(self.settings)
         self.consensus = EvidenceConsensusEngine()
         self.localization = LocalizationEngine()
         self.deterministic = DeterministicMicroMemoryEngine(self.gateway.profiles.rules)
@@ -126,7 +128,9 @@ class AgentOrchestrator:
                 for token in ("provincia", "regione", "prefettura", "città metropolitana")
             ) and not bool(re.search(r"\d", value))
         if field_key == "civico":
-            return bool(re.fullmatch(r"\d+[A-Za-z]?(?:[/ -][A-Za-z0-9]+)?", value))
+            return value.strip().upper() in {"SNC", "S.N.C.", "SENZA NUMERO"} or bool(
+                re.fullmatch(r"\d+[A-Za-z]?(?:[/ -][A-Za-z0-9]+)?", value.strip())
+            )
         if field_key == "categoria_catastale":
             return bool(re.fullmatch(r"[A-Za-z]/\d{2}", value.replace(" ", "")))
         if field_key == "subalterno":
@@ -139,7 +143,7 @@ class AgentOrchestrator:
         return True
 
     @staticmethod
-    def _normalize_value(field_key: str, value: str) -> str:
+    def _normalize_value(field_key: str, value: str, context: str = "") -> str:
         """Normalize strict public formats before validation and persistence."""
         if field_key in {"data_protocollo", "data_valutazione"}:
             match = re.fullmatch(r"(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{4})", value)
@@ -171,11 +175,21 @@ class AgentOrchestrator:
             value = value.upper()
         if field_key == "categoria_catastale":
             value = value.replace(" ", "").upper()
+        if field_key == "civico":
+            if value.strip().upper() in {"SNC", "S.N.C.", "SENZA NUMERO"}:
+                return "SNC"
+            match = re.search(r"\d+\s*[A-Za-z]?(?:\s*[/ -]\s*[A-Za-z0-9]+)?", value)
+            return re.sub(r"\s+", "", match.group(0)).upper() if match else "SNC"
         if field_key == "esito_valutazione":
-            if any(token in value.casefold() for token in ("approv", "favorevol", "positiv")):
-                return "POSITIVO"
-            if any(token in value.casefold() for token in ("respint", "contrari", "negativ", "rigett")):
+            lowered = f"{context} {value}".casefold()
+            negative = re.search(
+                r"\b(?:diniego|nega(?:to|ta|re)?|respint\w*|rigett\w*|sfavorevol\w*|contrari\w*|negativ\w*|non\s+(?:è\s+)?(?:favorevol\w*|positiv\w*|assent\w*|autorizzat\w*|accolt\w*)|impossibile\s+(?:assentire|autorizzare|accogliere))\b",
+                lowered,
+            )
+            if negative:
                 return "NEGATIVO"
+            if any(token in lowered for token in ("approv", "favorevol", "positiv", "accolt", "assent", "autorizz")):
+                return "POSITIVO"
         return value
 
     @staticmethod
@@ -201,6 +215,8 @@ class AgentOrchestrator:
             return bool(re.fullmatch(r"\d{2}/\d{2}/\d{4}", value))
         if field_key == "esito_valutazione":
             return value_lower in {"positivo", "negativo"}
+        if field_key == "civico" and value_lower in {"snc", "s.n.c.", "senza numero"}:
+            return any(marker in context for marker in ("via ", "viale ", "piazza ", "strada ", "contrada ", "località ", "ubicazione", "immobile"))
         if field_key == "civico":
             return any(
                 marker in context
@@ -216,10 +232,27 @@ class AgentOrchestrator:
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _outcome_context_priority(candidate: EntityCandidate) -> int:
+        """Prefer an explicit operative decision over a generic opinion adjective."""
+        text = (candidate.evidence_text or "").casefold()
+        if re.search(
+            r"\b(?:diniego|nega\w*|respint\w*|rigett\w*|non\s+\w{0,15}\s*(?:conced\w*|autorizz\w*|assent\w*|accolt\w*|rilasci\w*)|non\s+(?:favorevol\w*|positiv\w*)|parere\s+contrari\w*|esito\s+negativ\w*)",
+            text,
+        ):
+            return 4
+        if re.search(
+            r"\b(?:permess\w*\s+(?:concess\w*|negat\w*|respint\w*)|istanza\s+(?:accolt\w*|respint\w*|rigett\w*)|esito\s+(?:positiv\w*|negativ\w*)|(?:è\s+)?(?:concess\w*|autorizzat\w*|approvat\w*|accolt\w*)|parere\s+favorevol\w*)",
+            text,
+        ):
+            return 3 if candidate.raw_value == "NEGATIVO" else 2
+        return 0
+
     def _summary(
         self,
         winners: dict[str, EntityCandidate | None],
         field_definitions: dict[str, FieldDefinition] | None = None,
+        resolved_values: dict[str, str | None] | None = None,
     ) -> str:
         parts = []
         field_definitions = field_definitions or {}
@@ -230,13 +263,13 @@ class AgentOrchestrator:
         )
         for key in summary_fields:
             item = winners.get(key)
-            if item:
+            if item or (resolved_values and resolved_values.get(key)):
                 label = (
                     field_definitions[key].label
                     if key in field_definitions
                     else fields.get(key, {}).get("label", key)
                 )
-                parts.append(f"{label}: {item.raw_value}")
+                parts.append(f"{label}: {(resolved_values or {}).get(key) or item.raw_value}")
         max_length = int(summary.get("max_length", 100))
         return "; ".join(parts)[:max_length] or "NON_RILEVATO"
 
@@ -341,14 +374,14 @@ class AgentOrchestrator:
         return bonuses
 
     def _resume_or_create(
-        self, db: Session, document: Document, prompt_hash: str, page_count: int
+        self, db: Session, document: Document, prompt_hash: str,
     ) -> ProcessingRun:
         runs = db.scalars(
             select(ProcessingRun)
             .where(
                 ProcessingRun.document_id == document.id,
                 ProcessingRun.prompt_hash == prompt_hash,
-                ProcessingRun.status == "FAILED",
+                ProcessingRun.status.in_(("FAILED", "CANCELLED")),
             )
             .order_by(ProcessingRun.started_at.desc())
         )
@@ -356,16 +389,13 @@ class AgentOrchestrator:
             completed = db.scalar(
                 select(PageMicroMemory.id).where(PageMicroMemory.run_id == run.id).limit(1)
             )
-            count = len(
-                list(db.scalars(select(PageMicroMemory.id).where(PageMicroMemory.run_id == run.id)))
-            )
-            if completed and count < page_count:
+            if completed:
                 run.status, run.error, run.completed_at = "PROCESSING", None, None
                 return run
         run = ProcessingRun(
             document_id=document.id,
             pipeline_version=self.gateway.profiles.version,
-            model_name=self.settings.model_name,
+            model_name="MiniCPM-OCR + Qwen global selector",
             prompt_hash=prompt_hash,
             render_config={
                 "dpi": 120,
@@ -377,6 +407,7 @@ class AgentOrchestrator:
                 "ocr_engine": "MiniCPM-OCR",
                 "python_micro_memory_review": True,
                 "candidate_writer": "python_only",
+                "field_selector": "qwen_global_selector",
                 "global_candidates_per_field": int(
                     self.gateway.profiles.rules.get("review", {}).get(
                         "global_candidates_per_field", 5
@@ -500,6 +531,12 @@ class AgentOrchestrator:
                 .order_by(FieldDefinition.id)
             )
         )
+        fields = [field for field in fields if field.key != "sintesi"]
+        fields.sort(key=lambda item: (
+            item.key not in {"protocollo", "data_valutazione"},
+            0 if item.key == "protocollo" else 1 if item.key == "data_valutazione" else 2,
+            item.id,
+        ))
         definitions_by_key = {field.key: field for field in fields}
         deterministic_review = self.deterministic.analyze(page, fields, previous_context)
         rejected_deterministic_fields = sorted(
@@ -585,8 +622,15 @@ class AgentOrchestrator:
         for payload in payloads:
             field_key = str(payload.get("field_key", ""))
             value = " ".join(str(payload.get("raw_value", payload.get("value", ""))).split())
-            value = self._normalize_value(field_key, value)
             evidence_text = " ".join(str(payload.get("evidence_text", "")).split())[:240]
+            payload_context = payload.get("context") or self.deterministic.context_for(page, value)
+            outcome_context = " ".join(str(item) for item in (
+                payload_context.get("previous_lines", []),
+                payload_context.get("line_text", evidence_text),
+                payload_context.get("next_lines", []),
+                evidence_text,
+            ))
+            value = self._normalize_value(field_key, value, outcome_context)
             if field_key not in valid_keys or not value or field_key == "sintesi":
                 rejected_payloads.append(
                     {
@@ -618,7 +662,6 @@ class AgentOrchestrator:
             ):
                 bbox = self.localization.locate(value, page.blocks)
             source_engine = str(payload.get("source_engine", "deterministic_python"))
-            payload_context = payload.get("context") or self.deterministic.context_for(page, value)
             contextual_text = " | ".join(
                 str(item)
                 for item in (
@@ -776,7 +819,7 @@ class AgentOrchestrator:
         return clusters
 
     def _global_pass(
-        self, db: Session, run: ProcessingRun, document: Document, instructions: str
+        self, db: Session, run: ProcessingRun, document: Document, instructions: str,
     ):
         global_started = time.perf_counter()
         for model in (
@@ -789,13 +832,6 @@ class AgentOrchestrator:
         ):
             db.execute(delete(model).where(model.run_id == run.id))
         db.execute(delete(FieldResult).where(FieldResult.document_id == document.id))
-        micro_memories = list(
-            db.scalars(
-                select(PageMicroMemory)
-                .where(PageMicroMemory.run_id == run.id)
-                .order_by(PageMicroMemory.page_number)
-            )
-        )
         all_rows = list(db.scalars(select(EntityCandidate).where(EntityCandidate.run_id == run.id)))
         by_field: dict[str, list[EntityCandidate]] = defaultdict(list)
         for row in all_rows:
@@ -803,6 +839,7 @@ class AgentOrchestrator:
         relational_bonuses = self._relational_bonuses(by_field)
         winners: dict[str, EntityCandidate | None] = {}
         confidences: dict[str, float] = {}
+        resolved_values: dict[str, str | None] = {}
         fields = list(
             db.scalars(
                 select(FieldDefinition)
@@ -810,56 +847,81 @@ class AgentOrchestrator:
                 .order_by(FieldDefinition.id)
             )
         )
+        fields = [field for field in fields if field.key != "sintesi"]
+        fields.sort(key=lambda item: (
+            item.key not in {"protocollo", "data_valutazione"},
+            0 if item.key == "protocollo" else 1 if item.key == "data_valutazione" else 2,
+            item.id,
+        ))
+        global_review_metrics = None
         context_by_candidate = {
             payload.get("candidate_id"): payload.get("context", {})
-            for memory in micro_memories
+            for memory in db.scalars(
+                select(PageMicroMemory)
+                .where(PageMicroMemory.run_id == run.id)
+                .order_by(PageMicroMemory.page_number)
+            )
             for payload in memory.entity_candidates
             if isinstance(payload, dict) and payload.get("candidate_id")
         }
-        compact_global_memory: dict[str, list[dict]] = {}
         candidate_limit = min(
             5,
             max(1, int(self.gateway.profiles.rules.get("review", {}).get("global_candidates_per_field", 5))),
         )
+        compact_global_memory: dict[str, list[dict]] = {}
         for field in fields:
             candidate_pool = [
                 item
                 for item in self._eligible_candidates(field.key, by_field[field.key])
                 if self._selection_allowed(field.key, item, field)
             ]
+            if field.key == "data_valutazione":
+                outcome_pages = {
+                    item.page_number for item in by_field.get("esito_valutazione", [])
+                    if self._selection_allowed(
+                        "esito_valutazione", item,
+                        next((definition for definition in fields if definition.key == "esito_valutazione"), None),
+                    )
+                }
+                candidate_pool = [item for item in candidate_pool if item.page_number in outcome_pages]
+            if field.key == "esito_valutazione" and winners.get("data_valutazione"):
+                candidate_pool = [
+                    item for item in candidate_pool
+                    if item.page_number == winners["data_valutazione"].page_number
+                ]
+            if field.key == "data_protocollo" and winners.get("protocollo"):
+                candidate_pool = [
+                    item for item in candidate_pool
+                    if item.page_number == winners["protocollo"].page_number
+                ]
             ranked_rows = sorted(
                 candidate_pool,
                 key=lambda item: -(
-                    self._candidate_score(item)
-                    + relational_bonuses.get(item.id, 0.0)
+                    self._candidate_score(item) + relational_bonuses.get(item.id, 0.0)
                 ),
             )[:candidate_limit]
-            compact_global_memory[field.key] = [
-                {
-                    "candidate_id": item.id,
-                    "value": item.raw_value,
-                    "page_number": item.page_number,
-                    "semantic_role": item.semantic_role,
-                    "calculated_confidence": round(
-                        min(
-                            1.0,
-                            self._candidate_score(item)
-                            + relational_bonuses.get(item.id, 0.0),
+            if ranked_rows:
+                compact_global_memory[field.key] = [
+                    {
+                        "candidate_id": item.id,
+                        "value": item.raw_value,
+                        "page_number": item.page_number,
+                        "semantic_role": item.semantic_role,
+                        "calculated_confidence": round(
+                            min(1.0, self._candidate_score(item) + relational_bonuses.get(item.id, 0.0)),
+                            3,
                         ),
-                        3,
-                    ),
-                    "evidence": item.evidence_text,
-                    "context": {
-                        key: value
-                        for key, value in context_by_candidate.get(item.id, {}).items()
-                        if "bbox" not in str(key).casefold()
-                    },
-                }
-                for item in ranked_rows
-            ]
-        global_review_metrics = None
+                        "evidence": item.evidence_text,
+                        "context": {
+                            key: value
+                            for key, value in context_by_candidate.get(item.id, {}).items()
+                            if "bbox" not in str(key).casefold()
+                        },
+                    }
+                    for item in ranked_rows
+                ]
         global_selections: dict[str, dict] = {}
-        if any(compact_global_memory.values()):
+        if compact_global_memory:
             global_review = self.gateway.resolve_fields_global(
                 instructions,
                 compact_global_memory,
@@ -879,11 +941,36 @@ class AgentOrchestrator:
             selectable_rows = [
                 item for item in eligible_rows if self._selection_allowed(field.key, item, field)
             ]
+            if field.key == "data_valutazione":
+                outcome_definition = next(
+                    (definition for definition in fields if definition.key == "esito_valutazione"), None
+                )
+                outcome_pages = {
+                    item.page_number for item in by_field.get("esito_valutazione", [])
+                    if self._selection_allowed("esito_valutazione", item, outcome_definition)
+                }
+                selectable_rows = [item for item in selectable_rows if item.page_number in outcome_pages]
+            if field.key == "esito_valutazione":
+                evaluation_date = winners.get("data_valutazione")
+                selectable_rows = [
+                    item for item in selectable_rows
+                    if evaluation_date is not None and item.page_number == evaluation_date.page_number
+                ]
+            if field.key == "data_protocollo":
+                protocol = winners.get("protocollo")
+                selectable_rows = [
+                    item for item in selectable_rows
+                    if protocol is not None and item.page_number == protocol.page_number
+                ]
             if field.key == "civico" and winners.get("odonimo"):
                 selectable_rows = [
                     item for item in selectable_rows
                     if self._same_occurrence(winners["odonimo"], item)
                 ]
+            exact_value_copies: dict[str, int] = defaultdict(int)
+            for item in selectable_rows:
+                exact_value = " ".join(item.raw_value.split()).casefold()
+                exact_value_copies[exact_value] += 1
             for cluster in self._cluster_rows(selectable_rows):
                 pages = sorted({item.page_number for item in cluster})
                 representative = max(
@@ -913,32 +1000,74 @@ class AgentOrchestrator:
                 scored_clusters.append((confidence, representative, cluster_row, pages))
             scored_clusters.sort(key=lambda item: -item[0])
             winner = None
-            global_selected_by_resolver = False
-            global_selection = global_selections.get(field.key)
-            if global_selection and scored_clusters:
-                selected_id = global_selection.get("selected_candidate_id")
+            global_selected_by_qwen = False
+            global_selected_by_python = False
+            qwen_selection = global_selections.get(field.key)
+            if qwen_selection and scored_clusters:
+                selected_id = qwen_selection.get("selected_candidate_id")
                 if isinstance(selected_id, str) and selected_id.isdigit():
                     selected_id = int(selected_id)
-                chosen = next(
-                    (item for item in scored_clusters if selected_id in item[2].candidate_ids),
+                selected_row = next(
+                    (item for item in selectable_rows if item.id == selected_id), None
+                )
+                selected_cluster = next(
+                    (
+                        item
+                        for item in scored_clusters
+                        if selected_row and selected_row.id in item[2].candidate_ids
+                    ),
                     None,
                 )
-                selected_row = next(
-                    (item for item in by_field[field.key] if item.id == selected_id), None
-                )
-                if chosen and selected_row and self._selection_allowed(field.key, selected_row, field):
+                if selected_row and selected_cluster:
                     winner = (
-                        chosen[0],
+                        selected_cluster[0],
                         selected_row,
-                        chosen[2],
-                        chosen[3],
+                        selected_cluster[2],
+                        selected_cluster[3],
                     )
-                    global_selected_by_resolver = True
+                    global_selected_by_qwen = True
+            if field.key == "esito_valutazione" and selectable_rows:
+                decisive = max(
+                    selectable_rows,
+                    key=lambda item: (
+                        self._outcome_context_priority(item),
+                        self._candidate_score(item),
+                    ),
+                )
+                if self._outcome_context_priority(decisive) >= 3:
+                    decisive_cluster = next(
+                        item for item in scored_clusters
+                        if decisive.id in item[2].candidate_ids
+                    )
+                    winner = (
+                        decisive_cluster[0], decisive, decisive_cluster[2], decisive_cluster[3]
+                    )
+                    global_selected_by_qwen = False
+                    global_selected_by_python = True
+            if scored_clusters and winner is None:
+                best_candidate = max(
+                    selectable_rows,
+                    key=lambda item: (
+                        exact_value_copies[" ".join(item.raw_value.split()).casefold()],
+                        item.semantic_confidence,
+                        item.ocr_confidence,
+                    ),
+                )
+                best_cluster = next(
+                    item for item in scored_clusters if best_candidate.id in item[2].candidate_ids
+                )
+                winner = (best_cluster[0], best_candidate, best_cluster[2], best_cluster[3])
+                global_selected_by_python = True
 
             verified_null = (
                 field.key == "civico"
                 and winners.get("odonimo") is not None
                 and not scored_clusters
+            )
+            derived_snc = bool(
+                verified_null
+                and winners.get("comune")
+                and winners["comune"].page_number == winners["odonimo"].page_number
             )
             selected = winner[1] if winner else None
             confidence = (
@@ -958,12 +1087,16 @@ class AgentOrchestrator:
                 selected.selected = True
             for row in by_field[field.key]:
                 if not selected or row.id != selected.id:
-                    row.rejection_reason = "lower global confidence or semantic relevance"
+                    row.rejection_reason = "lower semantic confidence or OCR confidence"
             deterministic_summary = field.key == "sintesi"
             value = (
-                self._summary(winners, {item.key: item for item in fields})
+                self._summary(winners, {item.key: item for item in fields}, resolved_values)
                 if deterministic_summary
-                else (selected.raw_value if selected else None)
+                else (
+                    "SNC" if derived_snc
+                    else self._normalize_value(field.key, selected.raw_value) if selected
+                    else None
+                )
             )
             if deterministic_summary:
                 confidence = min(
@@ -971,18 +1104,33 @@ class AgentOrchestrator:
                     default=0.0,
                 )
                 confidences[field.key] = confidence
+            resolved_values[field.key] = value
+            selected_value_copies = (
+                exact_value_copies[" ".join(selected.raw_value.split()).casefold()]
+                if selected
+                else 0
+            )
+            qwen_reason_codes = qwen_selection.get("reason_codes", []) if qwen_selection else []
+            selection_reason_text = (
+                "; ".join(str(code) for code in qwen_reason_codes)
+                if global_selected_by_qwen and isinstance(qwen_reason_codes, list)
+                else "Qwen ha scelto il candidato dalla memoria globale; Python ha verificato ID, regole e confidence"
+                if global_selected_by_qwen
+                else (
+                    "Python: valore normalizzato più estratto "
+                    f"({selected_value_copies} occorrenze); "
+                    "confidence semantica massima nel gruppo, qualità OCR come spareggio"
+                )
+            )
             reason = (
                 [
-                    (
-                        "; ".join(global_selection.get("reason_codes", []))
-                        or "selected by local Qwen from Python Global Memory"
-                    )
-                    if global_selected_by_resolver
-                    else "Python wrote null because the selector did not choose a validated candidate"
+                    selection_reason_text
+                    if global_selected_by_qwen or global_selected_by_python
+                    else "Nessun candidato valido secondo le regole Python"
                 ]
                 if selected
                 else [
-                    "property address verified without a civic number; explicit null written"
+                    "Indirizzo dell’immobile senza numero civico: normalizzato in SNC"
                     if verified_null
                     else "candidate below 0.60 confidence; explicit null written"
                     if below_null_threshold and display_source
@@ -1020,7 +1168,8 @@ class AgentOrchestrator:
                     reasoning=reason,
                     validated_by=(
                         "PythonDeterministicSummary" if deterministic_summary
-                        else "QwenGlobalSelector" if global_selected_by_resolver
+                        else "QwenGlobalSelector" if global_selected_by_qwen
+                        else "PythonConfidenceSelector" if global_selected_by_python
                         else "PYTHON_NULL_UNSELECTED"
                     ),
                     candidates=[
@@ -1035,10 +1184,43 @@ class AgentOrchestrator:
                     ],
                 )
             )
+        commune, odonimo, civico = (winners.get(key) for key in ("comune", "odonimo", "civico"))
+        address_is_complete = bool(
+            commune and odonimo
+            and commune.page_number == odonimo.page_number
+            and (
+                (civico and self._same_occurrence(odonimo, civico))
+                or (not civico and resolved_values.get("civico") == "SNC")
+            )
+        )
+        if address_is_complete:
+            for key in ("comune", "odonimo", "civico"):
+                confidence = max(confidences.get(key, 0.0), 0.90)
+                confidences[key] = confidence
+                resolved = db.scalar(select(ResolvedField).where(
+                    ResolvedField.run_id == run.id, ResolvedField.field_key == key
+                ))
+                result = db.scalar(select(FieldResult).where(
+                    FieldResult.document_id == document.id, FieldResult.field_key == key
+                ))
+                clusters = db.scalars(select(EntityCluster).where(
+                    EntityCluster.run_id == run.id, EntityCluster.field_key == key
+                ))
+                for cluster in clusters:
+                    if cluster.normalized_value == (commune.normalized_value if key == "comune" else odonimo.normalized_value if key == "odonimo" else (civico.normalized_value if civico else "SNC")):
+                        cluster.global_confidence = confidence
+                for record in (resolved, result):
+                    if record:
+                        record.confidence = confidence
+                        if resolved and key != "civico" and resolved.selection_reason:
+                            resolved.selection_reason = [*resolved.selection_reason, "Indirizzo completo e coerente: confidence alta"]
+                if resolved and key == "civico" and resolved_values.get(key) == "SNC":
+                    resolved.selection_reason = [*resolved.selection_reason, "Indirizzo completo e coerente: confidence alta"]
         self._link_entities(db, run, document, winners, confidences)
         return {
             "duration_ms": round((time.perf_counter() - global_started) * 1000),
             "global_review_model_call": global_review_metrics,
+            "selector": "QWEN_GLOBAL_WITH_PYTHON_VALIDATION",
             "candidates": len(all_rows),
             "resolved_fields": len(fields),
             "populated_fields": len(fields),
@@ -1116,7 +1298,12 @@ class AgentOrchestrator:
             optimization,
         )
         db.commit()
-        run = self._resume_or_create(db, document, prompt_hash, total_pages)
+        run = self._resume_or_create(db, document, prompt_hash)
+        run.model_name = "MiniCPM-OCR + Qwen global selector"
+        run.render_config = {
+            **(run.render_config or {}),
+            "field_selector": "qwen_global_selector",
+        }
         document.status, document.pipeline_mode, document.error = "PROCESSING", mode, None
         document.page_count = total_pages
         self._audit(
@@ -1129,29 +1316,33 @@ class AgentOrchestrator:
                 "prompt_source": "ISTRUZIONI GLOBALI.md",
                 "rules_source": "instructions/pipeline_rules.json",
                 "rules_version": self.gateway.profiles.version,
+                "field_selector": "qwen_global_selector",
             },
         )
         db.commit()
+        active_model: str | None = None
         try:
             if should_cancel and should_cancel():
                 raise ProcessingInterrupted
-            health = self.gateway.wait_until_available(
-                retry_interval_sec=30, should_cancel=should_cancel
-            )
-            if should_cancel and should_cancel():
-                raise ProcessingInterrupted
-            self._audit(
-                db,
-                document.id,
-                "MODEL_HEALTH",
-                "Model server available",
-                health,
-            )
             completed_pages = set(
                 db.scalars(
                     select(PageMicroMemory.page_number).where(PageMicroMemory.run_id == run.id)
                 )
             )
+            needs_ocr = any(page_number not in completed_pages for page_number in range(1, total_pages + 1))
+            if needs_ocr:
+                if should_cancel and should_cancel():
+                    raise ProcessingInterrupted
+                ownership = self.model_supervisor.acquire("minicpm")
+                active_model = "minicpm"
+                self._audit(
+                    db,
+                    document.id,
+                    "MODEL_HEALTH",
+                    "MiniCPM acquired exclusive model memory for OCR",
+                    ownership,
+                )
+                db.commit()
             previous = None
             for page_number in range(1, total_pages + 1):
                 if should_cancel and should_cancel():
@@ -1199,27 +1390,53 @@ class AgentOrchestrator:
                 db.commit()
             if should_cancel and should_cancel():
                 raise ProcessingInterrupted
-            minicpm = MiniCPMOCRService(self.settings)
-            standby = minicpm.wait_until_standby(
-                self.settings.minicpm_standby_timeout_sec
-            )
+            if active_model == "minicpm":
+                released = self.model_supervisor.release("minicpm")
+                active_model = None
+                self._audit(
+                    db,
+                    document.id,
+                    "MODEL_SWITCH",
+                    "MiniCPM stopped and unloaded before Qwen global selection",
+                    released,
+                )
+                db.commit()
+            has_candidates = db.scalar(
+                select(EntityCandidate.id)
+                .where(EntityCandidate.run_id == run.id)
+                .limit(1)
+            ) is not None
+            if has_candidates:
+                ownership = self.model_supervisor.acquire("qwen")
+                active_model = "qwen"
+                self._audit(
+                    db,
+                    document.id,
+                    "MODEL_HEALTH",
+                    "Qwen acquired exclusive model memory for global selection",
+                    ownership,
+                )
+                db.commit()
             self._audit(
                 db,
                 document.id,
-                "MODEL_SWITCH",
-                "MiniCPM entered standby before Qwen global selection",
-                standby,
-            )
-            warmup = self.gateway.warmup()
-            self._audit(
-                db,
-                document.id,
-                "MODEL_WARMUP",
-                "Qwen warmed after MiniCPM standby",
-                warmup,
+                "SELECTOR",
+                "Qwen selected candidate IDs from Global Memory; Python validates and writes values",
+                {"selector": "QWEN_GLOBAL_WITH_PYTHON_VALIDATION"},
             )
             db.commit()
             global_metrics = self._global_pass(db, run, document, instructions)
+            if active_model == "qwen":
+                released = self.model_supervisor.release("qwen")
+                active_model = None
+                self._audit(
+                    db,
+                    document.id,
+                    "MODEL_SWITCH",
+                    "Qwen stopped and unloaded after global selection",
+                    released,
+                )
+                db.commit()
             if should_cancel and should_cancel():
                 raise ProcessingInterrupted
             run.status, run.completed_at = "COMPLETED", datetime.now(UTC)
@@ -1256,3 +1473,9 @@ class AgentOrchestrator:
             self._audit(db, document.id, "PIPELINE", "Processing failed", {"error": str(exc)})
             db.commit()
             raise
+        finally:
+            if active_model:
+                try:
+                    self.model_supervisor.release(active_model)
+                except Exception:
+                    logger.exception("Failed to unload %s after pipeline exit", active_model)
