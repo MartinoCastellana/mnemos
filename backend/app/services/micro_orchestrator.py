@@ -5,6 +5,7 @@ import time
 from collections import defaultdict
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import Callable
 
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
@@ -30,11 +31,15 @@ from app.db.models import (
 from app.services.deterministic_memory import DeterministicMicroMemoryEngine
 from app.services.extraction import EvidenceConsensusEngine, LocalizationEngine, ModelGateway
 from app.services.memory import OCRBlock, PageMemory
-from app.services.ocr import load_pdf_page, optimize_pdf
+from app.services.ocr import MiniCPMOCRService, load_pdf_page, optimize_pdf
 
 
 def clamp(value, default: float = 0.0) -> float:
     return min(1.0, max(0.0, float(value))) if isinstance(value, (int, float)) else default
+
+
+class ProcessingInterrupted(Exception):
+    """Raised at a safe checkpoint after the user requests an interruption."""
 
 
 class AgentOrchestrator:
@@ -59,10 +64,19 @@ class AgentOrchestrator:
         )
 
     @staticmethod
-    def _valid(field_key: str, value: str) -> bool:
+    def _valid(
+        field_key: str, value: str, field: FieldDefinition | None = None
+    ) -> bool:
         lowered = value.casefold()
         if not value.strip():
             return False
+        if field:
+            pattern = (field.validator or {}).get("value_pattern")
+            if pattern:
+                try:
+                    return bool(re.fullmatch(str(pattern), value, flags=re.IGNORECASE))
+                except re.error:
+                    return False
         if field_key == "protocollo":
             digits = sum(character.isdigit() for character in value)
             return digits >= 2 and digits / max(len(value), 1) >= 0.5 and not any(
@@ -117,6 +131,11 @@ class AgentOrchestrator:
             return bool(re.fullmatch(r"[A-Za-z]/\d{2}", value.replace(" ", "")))
         if field_key == "subalterno":
             return bool(re.fullmatch(r"\d{1,2}", value.strip()))
+        if field:
+            validator = field.validator or {}
+            minimum = int(validator.get("min_length", 1))
+            maximum = int(validator.get("max_length", 500))
+            return minimum <= len(value.strip()) <= maximum
         return True
 
     @staticmethod
@@ -197,8 +216,13 @@ class AgentOrchestrator:
         except (TypeError, ValueError):
             return None
 
-    def _summary(self, winners: dict[str, EntityCandidate | None]) -> str:
+    def _summary(
+        self,
+        winners: dict[str, EntityCandidate | None],
+        field_definitions: dict[str, FieldDefinition] | None = None,
+    ) -> str:
         parts = []
+        field_definitions = field_definitions or {}
         fields = self.gateway.profiles.rules.get("fields", {})
         summary = fields.get("sintesi", {})
         summary_fields = summary.get(
@@ -207,7 +231,11 @@ class AgentOrchestrator:
         for key in summary_fields:
             item = winners.get(key)
             if item:
-                label = fields.get(key, {}).get("label", key)
+                label = (
+                    field_definitions[key].label
+                    if key in field_definitions
+                    else fields.get(key, {}).get("label", key)
+                )
                 parts.append(f"{label}: {item.raw_value}")
         max_length = int(summary.get("max_length", 100))
         return "; ".join(parts)[:max_length] or "NON_RILEVATO"
@@ -341,7 +369,7 @@ class AgentOrchestrator:
             prompt_hash=prompt_hash,
             render_config={
                 "dpi": 120,
-                "preprocessing": "black_and_white_otsu",
+                "preprocessing": "color_preserving",
                 "orientation_detector": "tesseract_osd",
                 "orientation_confidence_threshold": 12.0,
                 "page_batch_size": 1,
@@ -431,15 +459,21 @@ class AgentOrchestrator:
         del field_key
         return list(rows)
 
-    def _selection_allowed(self, field_key: str, item: EntityCandidate) -> bool:
+    def _selection_allowed(
+        self,
+        field_key: str,
+        item: EntityCandidate,
+        definition: FieldDefinition | None = None,
+    ) -> bool:
         field_rules = self.gateway.profiles.field_config(field_key)
         profile = self.gateway.profiles.rules.get("profiles", {}).get(
             field_rules.get("profile"), {}
         )
-        allowed_roles = profile.get("allowed_roles", [])
+        strategy = definition.strategy or {} if definition else {}
+        allowed_roles = strategy.get("allowed_roles", profile.get("allowed_roles", []))
         if allowed_roles and item.semantic_role not in allowed_roles:
             return False
-        if not self._valid(field_key, item.raw_value):
+        if not self._valid(field_key, item.raw_value, definition):
             return False
         if not self._semantically_valid(field_key, item.raw_value, item.evidence_text):
             return False
@@ -466,12 +500,17 @@ class AgentOrchestrator:
                 .order_by(FieldDefinition.id)
             )
         )
+        definitions_by_key = {field.key: field for field in fields}
         deterministic_review = self.deterministic.analyze(page, fields, previous_context)
         rejected_deterministic_fields = sorted(
             {
                 str(item.get("field_key", ""))
                 for item in deterministic_review.candidates
-                if not self._valid(str(item.get("field_key", "")), str(item.get("raw_value", "")))
+                if not self._valid(
+                    str(item.get("field_key", "")),
+                    str(item.get("raw_value", "")),
+                    definitions_by_key.get(str(item.get("field_key", ""))),
+                )
                 or not self._semantically_valid(
                     str(item.get("field_key", "")),
                     str(item.get("raw_value", "")),
@@ -560,7 +599,7 @@ class AgentOrchestrator:
                     }
                 )
                 continue
-            format_valid = self._valid(field_key, value)
+            format_valid = self._valid(field_key, value, definitions_by_key.get(field_key))
             semantics_valid = self._semantically_valid(field_key, value, evidence_text)
             validation_warning = None
             if not format_valid:
@@ -786,7 +825,7 @@ class AgentOrchestrator:
             candidate_pool = [
                 item
                 for item in self._eligible_candidates(field.key, by_field[field.key])
-                if self._selection_allowed(field.key, item)
+                if self._selection_allowed(field.key, item, field)
             ]
             ranked_rows = sorted(
                 candidate_pool,
@@ -822,7 +861,9 @@ class AgentOrchestrator:
         global_selections: dict[str, dict] = {}
         if any(compact_global_memory.values()):
             global_review = self.gateway.resolve_fields_global(
-                instructions, compact_global_memory
+                instructions,
+                compact_global_memory,
+                {field.key: field for field in fields},
             )
             global_review_metrics = self.gateway.last_metrics
             selections = global_review.get("selections", [])
@@ -836,7 +877,7 @@ class AgentOrchestrator:
             scored_clusters = []
             eligible_rows = self._eligible_candidates(field.key, by_field[field.key])
             selectable_rows = [
-                item for item in eligible_rows if self._selection_allowed(field.key, item)
+                item for item in eligible_rows if self._selection_allowed(field.key, item, field)
             ]
             if field.key == "civico" and winners.get("odonimo"):
                 selectable_rows = [
@@ -885,7 +926,7 @@ class AgentOrchestrator:
                 selected_row = next(
                     (item for item in by_field[field.key] if item.id == selected_id), None
                 )
-                if chosen and selected_row and self._selection_allowed(field.key, selected_row):
+                if chosen and selected_row and self._selection_allowed(field.key, selected_row, field):
                     winner = (
                         chosen[0],
                         selected_row,
@@ -920,7 +961,7 @@ class AgentOrchestrator:
                     row.rejection_reason = "lower global confidence or semantic relevance"
             deterministic_summary = field.key == "sintesi"
             value = (
-                self._summary(winners)
+                self._summary(winners, {item.key: item for item in fields})
                 if deterministic_summary
                 else (selected.raw_value if selected else None)
             )
@@ -1040,10 +1081,27 @@ class AgentOrchestrator:
                     )
                 )
 
-    def process(self, db: Session, document_id: str, mode: str = "AUTO") -> None:
+    def process(
+        self,
+        db: Session,
+        document_id: str,
+        mode: str = "AUTO",
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> None:
         document = db.get(Document, document_id)
         if not document:
             raise ValueError("Documento non trovato")
+        if should_cancel and should_cancel():
+            document.status, document.error = "CANCELLED", None
+            self._audit(
+                db,
+                document.id,
+                "INTERRUPT",
+                "Queued processing interrupted before optimization",
+                {"status": "CANCELLED"},
+            )
+            db.commit()
+            return
         instructions = self.settings.load_instructions()
         canonical_rules = json.dumps(
             self.gateway.profiles.rules, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -1075,7 +1133,13 @@ class AgentOrchestrator:
         )
         db.commit()
         try:
-            health = self.gateway.check_health()
+            if should_cancel and should_cancel():
+                raise ProcessingInterrupted
+            health = self.gateway.wait_until_available(
+                retry_interval_sec=30, should_cancel=should_cancel
+            )
+            if should_cancel and should_cancel():
+                raise ProcessingInterrupted
             self._audit(
                 db,
                 document.id,
@@ -1083,7 +1147,6 @@ class AgentOrchestrator:
                 "Model server available",
                 health,
             )
-            db.commit()
             completed_pages = set(
                 db.scalars(
                     select(PageMicroMemory.page_number).where(PageMicroMemory.run_id == run.id)
@@ -1091,6 +1154,8 @@ class AgentOrchestrator:
             )
             previous = None
             for page_number in range(1, total_pages + 1):
+                if should_cancel and should_cancel():
+                    raise ProcessingInterrupted
                 existing = db.scalar(
                     select(PageMicroMemory).where(
                         PageMicroMemory.run_id == run.id,
@@ -1132,7 +1197,31 @@ class AgentOrchestrator:
                     },
                 )
                 db.commit()
+            if should_cancel and should_cancel():
+                raise ProcessingInterrupted
+            minicpm = MiniCPMOCRService(self.settings)
+            standby = minicpm.wait_until_standby(
+                self.settings.minicpm_standby_timeout_sec
+            )
+            self._audit(
+                db,
+                document.id,
+                "MODEL_SWITCH",
+                "MiniCPM entered standby before Qwen global selection",
+                standby,
+            )
+            warmup = self.gateway.warmup()
+            self._audit(
+                db,
+                document.id,
+                "MODEL_WARMUP",
+                "Qwen warmed after MiniCPM standby",
+                warmup,
+            )
+            db.commit()
             global_metrics = self._global_pass(db, run, document, instructions)
+            if should_cancel and should_cancel():
+                raise ProcessingInterrupted
             run.status, run.completed_at = "COMPLETED", datetime.now(UTC)
             document.status = "COMPLETED"
             self._audit(
@@ -1141,6 +1230,21 @@ class AgentOrchestrator:
                 "GLOBAL_PASS",
                 "Global Document Memory consolidated and final fields selected",
                 {"pages": total_pages, "rank_used": False, **global_metrics},
+            )
+            db.commit()
+        except ProcessingInterrupted:
+            db.rollback()
+            document = db.get(Document, document_id)
+            run = db.get(ProcessingRun, run.id)
+            now = datetime.now(UTC)
+            document.status, document.error = "CANCELLED", None
+            run.status, run.error, run.completed_at = "CANCELLED", None, now
+            self._audit(
+                db,
+                document.id,
+                "INTERRUPT",
+                "Processing interrupted at a safe checkpoint",
+                {"status": "CANCELLED"},
             )
             db.commit()
         except Exception as exc:

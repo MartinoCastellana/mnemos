@@ -1,11 +1,12 @@
 import base64
 import json
+import logging
 import re
 import time
 from dataclasses import asdict, dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, Callable, ClassVar
 
 import fitz
 import httpx
@@ -14,6 +15,8 @@ from app.core.config import Settings
 from app.db.models import FieldDefinition
 from app.services.instruction_profiles import InstructionProfileCompiler, load_pipeline_rules
 from app.services.memory import GlobalDocumentMemory, OCRBlock
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -81,6 +84,60 @@ class ModelGateway:
             "available": True,
             "latency_ms": round((time.perf_counter() - started) * 1000),
             "models": len(payload.get("data", [])) if isinstance(payload, dict) else 0,
+        }
+
+    def wait_until_available(
+        self,
+        retry_interval_sec: int = 30,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        """Wait for the Qwen server, retrying every 30 seconds while it is down."""
+        while True:
+            if should_cancel and should_cancel():
+                return {"available": False, "cancel_requested": True}
+            try:
+                return self.check_health()
+            except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+                logger.warning(
+                    "Qwen model server is unreachable (%s); retrying in %s seconds",
+                    exc,
+                    retry_interval_sec,
+                )
+                for _ in range(retry_interval_sec):
+                    if should_cancel and should_cancel():
+                        return {"available": False, "cancel_requested": True}
+                    time.sleep(1)
+
+    def warmup(self) -> dict[str, Any]:
+        """Run a tiny generation so Qwen is ready before page OCR begins."""
+        started = time.perf_counter()
+        response = httpx.post(
+            f"{self.settings.model_endpoint.rstrip('/')}/v1/chat/completions",
+            json={
+                "model": self.settings.model_name,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": 'Restituisci un JSON con "warmup": true.',
+                    }
+                ],
+                "temperature": 0,
+                "max_tokens": 8,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=120,
+        )
+        if response.is_error:
+            raise RuntimeError(
+                f"Model warmup {response.status_code}: {response.text[:1000]}"
+            )
+        payload = response.json()
+        usage = payload.get("usage", {}) if isinstance(payload, dict) else {}
+        return {
+            "available": True,
+            "latency_ms": round((time.perf_counter() - started) * 1000),
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
         }
 
     @staticmethod
@@ -267,7 +324,10 @@ class ModelGateway:
         return parsed
 
     def resolve_fields_global(
-        self, instructions: str, candidates_by_field: dict[str, list[dict]]
+        self,
+        instructions: str,
+        candidates_by_field: dict[str, list[dict]],
+        field_definitions: dict[str, FieldDefinition] | None = None,
     ) -> dict[str, Any]:
         del instructions
         rules = self.profiles.rules
@@ -277,13 +337,31 @@ class ModelGateway:
             if candidates
         }
         field_rules: dict[str, dict[str, Any]] = {}
+        field_definitions = field_definitions or {}
         for field_key in global_memory:
             config = self.profiles.field_config(field_key)
             profile = rules.get("profiles", {}).get(config.get("profile"), {})
+            definition = field_definitions.get(field_key)
+            strategy = definition.strategy or {} if definition else {}
+            instructions_for_field = [
+                str(value).strip()
+                for value in (
+                    profile.get("selection_instruction", ""),
+                    definition.instructions if definition else "",
+                )
+                if str(value).strip()
+            ]
             field_rules[field_key] = {
-                "label": config.get("label", field_key),
-                "allowed_roles": profile.get("allowed_roles", ["SCONOSCIUTO"]),
-                "selection_instruction": profile.get("selection_instruction", ""),
+                "label": definition.label if definition else config.get("label", field_key),
+                "allowed_roles": strategy.get(
+                    "allowed_roles", profile.get("allowed_roles", ["SCONOSCIUTO"])
+                ),
+                "selection_instruction": "\n".join(dict.fromkeys(instructions_for_field)),
+                "extraction_keywords": strategy.get("keywords", []),
+                "positive_examples": definition.positive_examples if definition else [],
+                "negative_examples": definition.negative_examples if definition else [],
+                "ranking_rules": definition.ranking_rules if definition else [],
+                "validator": definition.validator if definition else {},
             }
         source = {
             "fields": field_rules,
@@ -298,6 +376,8 @@ relativa lista della global_memory. Non inventare, correggere, completare o tras
 valori: restituisci esclusivamente gli ID e brevi reason_codes. Considera ruolo,
 evidenza, contesto, pagina e confidence. Rispetta le istruzioni e i ruoli ammessi per
 ciascun campo. Le coppie in same_page_pairs devono riferirsi alla stessa pagina.
+Considera anche esempi positivi, esempi da escludere, ranking_rules e validator
+specifici del campo. Questi criteri possono solo aiutare a scegliere tra gli ID forniti.
 Restituisci un oggetto JSON con una scelta per ogni campo presente in fields:
 {"selections":[{"field_key":"...","selected_candidate_id":0,"reason_codes":["..."]}]}.
 """

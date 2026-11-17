@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef } from "react";
-import { Activity, Braces, Check, Circle, LoaderCircle, Play } from "lucide-react";
+import { Activity, Braces, Check, Circle, LoaderCircle, Play, ScanText } from "lucide-react";
 import type { Audit, Detail, DocumentMemory } from "../lib/api";
 
-type Props = { detail: Detail; memory?: DocumentMemory };
+type Props = { detail: Detail; memory?: DocumentMemory; showAnalysisPrompt?: boolean };
 const labels: Record<string, string> = {
   INGESTION: "Acquisizione file",
   OPTIMIZATION: "Ottimizzazione PDF",
@@ -15,6 +15,7 @@ const labels: Record<string, string> = {
   EXTRACTION: "Estrazione campi",
   GLOBAL_PASS: "Consolidamento globale",
   RESET: "Reset",
+  INTERRUPT: "Interruzione",
   MANUAL_EDIT: "Modifica manuale",
 };
 const detailLabels: Record<string, string> = {
@@ -54,6 +55,7 @@ const narration = (event: Audit) => {
     return "Qwen sceglie tra i candidati della memoria globale; Python valida e scrive i risultati.";
   if (event.stage === "RESET")
     return "Rimuovo i risultati precedenti mantenendo PDF e OCR disponibili.";
+  if (event.stage === "INTERRUPT") return "Interrompo la run al checkpoint sicuro raggiunto.";
   if (event.stage === "MANUAL_EDIT")
     return "Registro la correzione dell’operatore come valore validato manualmente.";
   return event.action;
@@ -104,7 +106,7 @@ const engines = (event: Audit) => {
   );
 };
 
-export function PipelineLog({ detail, memory }: Props) {
+export function PipelineLog({ detail, memory, showAnalysisPrompt = false }: Props) {
   const feedRef = useRef<HTMLDivElement>(null);
   const events = useMemo(() => {
     if (!memory?.run) return [];
@@ -125,6 +127,8 @@ export function PipelineLog({ detail, memory }: Props) {
         ? "Analisi completata"
         : detail.status === "FAILED"
           ? "Pipeline interrotta"
+        : detail.status === "CANCELLED"
+          ? "Analisi interrotta"
           : done < total
             ? `OCR e analisi pagina ${Math.min(done + 1, total || 1)}`
             : "Consolidamento ed estrazione finale";
@@ -170,15 +174,24 @@ export function PipelineLog({ detail, memory }: Props) {
         </div>
       </div>
       <div className="pipeline-feed" ref={feedRef}>
-        {events.length === 0 ? (
+        {showAnalysisPrompt && (
+          <div className="pipeline-empty">
+            <ScanText />
+            <span>Avvia un’analisi del fascicolo per estrarre campi e contenuti.</span>
+          </div>
+        )}
+        {events.length === 0 && !showAnalysisPrompt ? (
           <div className="pipeline-empty">
             <LoaderCircle className={running ? "spin" : ""} />
             <span>
-              {running ? "Preparazione file e inizializzazione OCR…" : "Nessun evento registrato."}
+              {running
+                ? "Preparazione file e inizializzazione OCR…"
+                : detail.status === "CANCELLED"
+                  ? "Analisi interrotta."
+                  : "Nessun evento registrato."}
             </span>
           </div>
-        ) : (
-          events.map((event, index) => {
+        ) : events.map((event, index) => {
             const current = index === 0 && running;
             return (
               <div className="pipeline-event" key={event.id}>
@@ -199,8 +212,7 @@ export function PipelineLog({ detail, memory }: Props) {
                 </div>
               </div>
             );
-          })
-        )}
+          })}
       </div>
     </aside>
   );

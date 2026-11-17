@@ -10,10 +10,8 @@ DEFAULT_FIELDS = [
 
 def seed_default_fields(db) -> None:
     existing = {field.key: field for field in db.query(FieldDefinition).all()}
-    expected = {item[0] for item in DEFAULT_FIELDS}
-    for key, field in existing.items():
-        if key not in expected:
-            db.delete(field)
+    if existing:
+        return
     for key, label, keywords, pattern in DEFAULT_FIELDS:
         canonical = RULES["fields"][key]
         profile = RULES.get("profiles", {}).get(canonical.get("profile"), {})
@@ -42,9 +40,5 @@ def seed_default_fields(db) -> None:
             else {"type": "summary", "keywords": []},
             "enabled": True,
         }
-        if key in existing:
-            for attribute, value in values.items():
-                setattr(existing[key], attribute, value)
-        else:
-            db.add(FieldDefinition(key=key, **values))
+        db.add(FieldDefinition(key=key, **values))
     db.commit()

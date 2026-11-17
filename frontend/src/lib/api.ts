@@ -81,6 +81,8 @@ export type DocumentMemory = {
     requires_review: boolean;
     selected: boolean;
     rejection_reason: string | null;
+    global_relevance: number;
+    relevance_source: "global_cluster" | "candidate_score";
   }>;
   resolved_fields: Array<{
     field_key: string;
@@ -165,6 +167,12 @@ const json = async <T>(path: string, init?: RequestInit): Promise<T> => {
 export const api = {
   documents: () => json<Document[]>("/api/documents"),
   fields: () => json<FieldDefinition[]>("/api/fields"),
+  saveFields: (fields: FieldDefinition[]) =>
+    json<FieldDefinition[]>("/api/fields", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(fields),
+    }),
   detail: (id: string) => json<Detail>(`/api/documents/${id}`),
   memory: (id: string) => json<DocumentMemory>(`/api/documents/${id}/memory`),
   runAnalytics: (id: string) => json<RunAnalytics[]>(`/api/documents/${id}/runs/analytics`),
@@ -180,6 +188,8 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ mode }),
     }),
+  interrupt: (id: string) =>
+    json<{ id: string; status: string }>(`/api/documents/${id}/interrupt`, { method: "POST" }),
   processPending: (mode: string) =>
     json<{ status: string; count: number; document_ids: string[] }>(
       "/api/documents/process-pending",

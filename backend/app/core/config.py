@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     minicpm_layout_model_dir: str = ""
     minicpm_layout_threshold: float = 0.3
     minicpm_timeout_sec: int = 300
+    minicpm_sleep_idle_seconds: int = 30
+    minicpm_standby_timeout_sec: int = 90
     minicpm_render_dpi: int = 120
     minicpm_max_tokens: int = 8192
     instructions_path: Path = Path("../docs/ISTRUZIONI GLOBALI.md")

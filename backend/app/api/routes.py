@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 from pathlib import Path
+import re
 import shutil
 from threading import Lock
 
@@ -53,23 +54,41 @@ from app.services.recovery import recover_interrupted_processing
 
 router = APIRouter(prefix="/api")
 active_documents: set[str] = set()
+cancel_requested_documents: set[str] = set()
 active_documents_lock = Lock()
+# MiniCPM-OCR and Qwen share the local machine's compute and memory. Keep
+# complete document pipelines serial so the two model services are never used
+# concurrently by separate background requests.
+model_pipeline_lock = Lock()
+
+
+def _process_document_serially(db: Session, document_id: str, mode: str):
+    with model_pipeline_lock:
+        AgentOrchestrator().process(
+            db, document_id, mode, should_cancel=lambda: _cancel_requested(document_id)
+        )
+
+
+def _cancel_requested(document_id: str) -> bool:
+    with active_documents_lock:
+        return document_id in cancel_requested_documents
 
 
 def process_background(document_id: str, mode: str):
     try:
         with SessionLocal() as db:
-            AgentOrchestrator().process(db, document_id, mode)
+            _process_document_serially(db, document_id, mode)
     finally:
         with active_documents_lock:
             active_documents.discard(document_id)
+            cancel_requested_documents.discard(document_id)
 
 
 def process_batch_background(document_ids: list[str], mode: str):
     for document_id in document_ids:
         try:
             with SessionLocal() as db:
-                AgentOrchestrator().process(db, document_id, mode)
+                _process_document_serially(db, document_id, mode)
         except Exception:
             # The orchestrator persists FAILED on the current document. Keep the
             # batch moving so one bad file cannot block the remaining queue.
@@ -77,6 +96,7 @@ def process_batch_background(document_ids: list[str], mode: str):
         finally:
             with active_documents_lock:
                 active_documents.discard(document_id)
+                cancel_requested_documents.discard(document_id)
 
 
 @router.get("/health")
@@ -184,6 +204,20 @@ def process_document(
         raise
     tasks.add_task(process_background, document_id, request.mode)
     return {"id": document.id, "status": "QUEUED", "mode": request.mode}
+
+
+@router.post("/documents/{document_id}/interrupt", status_code=status.HTTP_202_ACCEPTED)
+def interrupt_document(document_id: str, db: Session = Depends(get_db)):
+    document = db.get(Document, document_id)
+    if not document:
+        raise HTTPException(status_code=404, detail="Documento non trovato")
+    if document.status not in {"PROCESSING", "QUEUED"}:
+        raise HTTPException(status_code=409, detail="Nessuna elaborazione attiva da interrompere")
+    with active_documents_lock:
+        if document_id not in active_documents:
+            raise HTTPException(status_code=409, detail="Elaborazione non attiva")
+        cancel_requested_documents.add(document_id)
+    return {"id": document.id, "status": "CANCEL_REQUESTED"}
 
 
 @router.delete("/documents/{document_id}/results")
@@ -425,6 +459,12 @@ def document_memory(document_id: str, db: Session = Depends(get_db)):
             .order_by(EntityCluster.field_key, EntityCluster.global_confidence.desc())
         )
     )
+    relevance_by_candidate: dict[int, float] = {}
+    for cluster in entity_clusters:
+        for candidate_id in cluster.candidate_ids:
+            relevance_by_candidate[candidate_id] = max(
+                relevance_by_candidate.get(candidate_id, 0.0), cluster.global_confidence
+            )
     recovery_requests = list(
         db.scalars(select(RecoveryRequest).where(RecoveryRequest.run_id == run.id))
     )
@@ -460,6 +500,16 @@ def document_memory(document_id: str, db: Session = Depends(get_db)):
                 "requires_review": item.requires_review,
                 "selected": item.selected,
                 "rejection_reason": item.rejection_reason,
+                "global_relevance": round(
+                    relevance_by_candidate.get(
+                        item.id,
+                        item.semantic_confidence * 0.75 + item.ocr_confidence * 0.25,
+                    ),
+                    3,
+                ),
+                "relevance_source": (
+                    "global_cluster" if item.id in relevance_by_candidate else "candidate_score"
+                ),
             }
             for item in candidates
         ],
@@ -766,6 +816,56 @@ def optimized_document_file(document_id: str, db: Session = Depends(get_db)):
 
 @router.get("/fields", response_model=list[FieldDefinitionOut])
 def list_fields(db: Session = Depends(get_db)):
+    return list(db.scalars(select(FieldDefinition).order_by(FieldDefinition.id)))
+
+
+@router.put("/fields", response_model=list[FieldDefinitionOut])
+def save_field_configuration(
+    payload: list[FieldDefinitionIn], db: Session = Depends(get_db)
+):
+    if not payload:
+        raise HTTPException(status_code=422, detail="Configura almeno un campo")
+    keys = [field.key for field in payload]
+    if len(keys) != len(set(keys)):
+        raise HTTPException(status_code=422, detail="Le chiavi dei campi devono essere uniche")
+    for field in payload:
+        patterns = [
+            (field.strategy.get("pattern"), True),
+            (field.validator.get("value_pattern"), False),
+        ]
+        for pattern, extraction_pattern in patterns:
+            if not pattern:
+                continue
+            try:
+                compiled = re.compile(str(pattern), re.IGNORECASE)
+            except re.error as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Pattern non valido per {field.label}: {exc}",
+                ) from exc
+            if extraction_pattern and "value" not in compiled.groupindex:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Il pattern di estrazione per {field.label} deve includere (?P<value>...).",
+                )
+
+    existing = {
+        field.key: field
+        for field in db.scalars(select(FieldDefinition)).all()
+    }
+    incoming = set(keys)
+    for key, field in existing.items():
+        if key not in incoming:
+            db.delete(field)
+    for payload_field in payload:
+        values = payload_field.model_dump()
+        field = existing.get(payload_field.key)
+        if field is None:
+            db.add(FieldDefinition(**values))
+        else:
+            for name, value in values.items():
+                setattr(field, name, value)
+    db.commit()
     return list(db.scalars(select(FieldDefinition).order_by(FieldDefinition.id)))
 
 

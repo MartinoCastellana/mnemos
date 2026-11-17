@@ -4,10 +4,9 @@ import {
   ChevronRight,
   ArrowRightLeft,
   FileSearch,
-  BookOpenText,
-  LoaderCircle,
   RotateCcw,
   ScanText,
+  Settings,
   Timer,
   Upload,
   X,
@@ -23,6 +22,7 @@ import {
 import { fieldLabel, fieldOrder } from "./lib/fields";
 import { PageViewer } from "./components/PageViewer";
 import { PipelineLog } from "./components/PipelineLog";
+import { SettingsDialog } from "./components/SettingsDialog";
 import "./styles.css";
 import "./reset.css";
 
@@ -39,8 +39,7 @@ export default function App() {
     [fields, setFields] = useState<FieldDefinition[]>([]),
     [detail, setDetail] = useState<Detail>(),
     [memory, setMemory] = useState<DocumentMemory>(),
-    [selectedResult, setSelectedResult] = useState<Result>(),
-    [rulesField, setRulesField] = useState<FieldDefinition>(),
+    [selectedFieldKey, setSelectedFieldKey] = useState<string>(),
     [candidateField, setCandidateField] = useState<FieldDefinition>(),
     [savingCandidateId, setSavingCandidateId] = useState<number>(),
     [pageNumber, setPageNumber] = useState<number>(),
@@ -49,15 +48,21 @@ export default function App() {
     [documentsOpen, setDocumentsOpen] = useState(false),
     [viewerTab, setViewerTab] = useState<ViewerTab>("original"),
     [localRunStartedAt, setLocalRunStartedAt] = useState<number>(),
+    [interruptRequested, setInterruptRequested] = useState(false),
+    [settingsOpen, setSettingsOpen] = useState(false),
+    [settingsFields, setSettingsFields] = useState<FieldDefinition[]>([]),
+    [settingsSaving, setSettingsSaving] = useState(false),
+    [settingsError, setSettingsError] = useState(""),
     [elapsedSeconds, setElapsedSeconds] = useState(0);
   const input = useRef<HTMLInputElement>(null);
-  const rulesCloseRef = useRef<HTMLButtonElement>(null);
+  const candidateCloseRef = useRef<HTMLButtonElement>(null);
   const progressRef = useRef("");
   const activeDocumentRef = useRef<string | undefined>(undefined);
   const displayedDocumentRef = useRef<string | undefined>(undefined);
   const refreshRequestRef = useRef(0);
   const batchIsProcessing = documents.some((doc) => ["PROCESSING", "QUEUED"].includes(doc.status));
   const isProcessing = detail?.status === "PROCESSING" || detail?.status === "QUEUED";
+  const canReset = ["COMPLETED", "FAILED", "CANCELLED"].includes(detail?.status ?? "");
   const persistedRunStartedAt = memory?.run?.started_at
     ? new Date(memory.run.started_at).getTime()
     : undefined;
@@ -87,7 +92,7 @@ export default function App() {
         setPageNumber((p) =>
           documentChanged ? next.pages[0]?.page_number : (p ?? next.pages[0]?.page_number),
         );
-        if (documentChanged) setSelectedResult(undefined);
+        if (documentChanged) setSelectedFieldKey(undefined);
       }
     } catch (e) {
       setError(String(e));
@@ -100,12 +105,13 @@ export default function App() {
     }
     activeDocumentRef.current = id;
     refreshRequestRef.current += 1;
-    setSelectedResult(undefined);
+    setSelectedFieldKey(undefined);
     setPageNumber(undefined);
     setMemory(undefined);
     setDetail(undefined);
     setViewerTab("original");
     setLocalRunStartedAt(undefined);
+    setInterruptRequested(false);
     setElapsedSeconds(0);
     setDocumentsOpen(false);
     void refresh(id);
@@ -150,17 +156,8 @@ export default function App() {
       .catch((reason) => setError(String(reason)));
   }, []);
   useEffect(() => {
-    if (!rulesField) return;
-    rulesCloseRef.current?.focus();
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setRulesField(undefined);
-    };
-    window.addEventListener("keydown", closeOnEscape);
-    return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [rulesField]);
-  useEffect(() => {
     if (!candidateField) return;
-    rulesCloseRef.current?.focus();
+    candidateCloseRef.current?.focus();
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape") setCandidateField(undefined);
     };
@@ -186,6 +183,9 @@ export default function App() {
       return !result || !result.value?.trim();
     });
   }, [detail?.results, fields]);
+  const hasExtractedData = orderedResults.some((result) => Boolean(result.value?.trim())) ||
+    (memory?.candidates.length ?? 0) > 0;
+  const showAnalysisPrompt = !isProcessing && !hasExtractedData;
   const candidatesByField = useMemo(() => {
     const grouped = new Map<string, NonNullable<DocumentMemory>["candidates"]>();
     for (const candidate of memory?.candidates ?? []) {
@@ -195,6 +195,47 @@ export default function App() {
     }
     return grouped;
   }, [memory?.candidates]);
+  const selectedCandidateByField = useMemo(() => {
+    const candidateById = new Map((memory?.candidates ?? []).map((candidate) => [candidate.id, candidate]));
+    const selected = new Map(
+      (memory?.candidates ?? [])
+        .filter((candidate) => candidate.selected)
+        .map((candidate) => [candidate.field_key, candidate]),
+    );
+    for (const resolved of memory?.resolved_fields ?? []) {
+      const candidate = resolved.selected_candidate_id
+        ? candidateById.get(resolved.selected_candidate_id)
+        : undefined;
+      if (candidate) selected.set(resolved.field_key, candidate);
+    }
+    return selected;
+  }, [memory?.candidates, memory?.resolved_fields]);
+  const bestCandidateByField = useMemo(() => {
+    const best = new Map<string, NonNullable<DocumentMemory>["candidates"][number]>();
+    for (const [fieldKey, candidates] of candidatesByField) {
+      const candidate = [...candidates].sort(
+        (a, b) =>
+          b.ocr_confidence - a.ocr_confidence ||
+          b.vision_confidence - a.vision_confidence ||
+          b.semantic_confidence - a.semantic_confidence ||
+          a.id - b.id,
+      )[0];
+      if (candidate) best.set(fieldKey, candidate);
+    }
+    return best;
+  }, [candidatesByField]);
+  const valueChosenByAI = (fieldKey: string) => {
+    const result = detail?.results.find((item) => item.field_key === fieldKey);
+    const resolved = memory?.resolved_fields.find((item) => item.field_key === fieldKey);
+    const candidate = selectedCandidateByField.get(fieldKey);
+    return (
+      result?.value?.trim() ||
+      resolved?.value?.trim() ||
+      candidate?.normalized_value ||
+      candidate?.raw_value ||
+      ""
+    );
+  };
   const upload = async (file?: File) => {
     if (!file) return;
     setBusy(true);
@@ -210,14 +251,57 @@ export default function App() {
       setBusy(false);
     }
   };
+  const openSettings = async () => {
+    try {
+      setSettingsError("");
+      const configuredFields = await api.fields();
+      setSettingsFields(configuredFields);
+      setSettingsOpen(true);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+  const saveSettings = async (updatedFields: FieldDefinition[]) => {
+    setSettingsSaving(true);
+    setSettingsError("");
+    try {
+      const savedFields = await api.saveFields(updatedFields);
+      setSettingsFields(savedFields);
+      setFields(savedFields.filter((field) => field.enabled));
+      setSelectedFieldKey((current) =>
+        current && savedFields.some((field) => field.key === current && field.enabled)
+          ? current
+          : undefined,
+      );
+      setSettingsOpen(false);
+    } catch (e) {
+      setSettingsError(String(e));
+    } finally {
+      setSettingsSaving(false);
+    }
+  };
   const process = async () => {
     if (!detail || isProcessing) return;
     setBusy(true);
+    setInterruptRequested(false);
     setLocalRunStartedAt(Date.now());
     setViewerTab("original");
     try {
       await api.process(detail.id, "AUTO");
       await refresh(detail.id);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const interrupt = async () => {
+    if (!detail || !isProcessing || interruptRequested) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api.interrupt(detail.id);
+      setInterruptRequested(true);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -237,10 +321,11 @@ export default function App() {
     try {
       await api.resetDocument(detail.id);
       setMemory(undefined);
-      setSelectedResult(undefined);
+      setSelectedFieldKey(undefined);
       setPageNumber(undefined);
       setViewerTab("original");
       setLocalRunStartedAt(undefined);
+      setInterruptRequested(false);
       setElapsedSeconds(0);
       progressRef.current = "";
       await refresh(detail.id);
@@ -264,8 +349,10 @@ export default function App() {
     }
   };
   const chooseResult = (result: Result) => {
-    setSelectedResult(result);
-    if (result.page_number) navigateToPage(result.page_number);
+    setSelectedFieldKey(result.field_key);
+    const candidate = bestCandidateByField.get(result.field_key) ?? selectedCandidateByField.get(result.field_key);
+    const page = candidate?.page_number ?? result.page_number;
+    if (page) navigateToPage(page);
   };
   const navigateToPage = (page: number) => {
     setPageNumber(page);
@@ -276,6 +363,26 @@ export default function App() {
         ?.scrollIntoView({ behavior: "smooth", block: "start" }),
     );
   };
+  const chooseField = (fieldKey: string) => {
+    setSelectedFieldKey(fieldKey);
+    const result = detail?.results.find((item) => item.field_key === fieldKey);
+    if (result?.page_number) {
+      navigateToPage(result.page_number);
+      return;
+    }
+    const candidate = bestCandidateByField.get(fieldKey) ?? selectedCandidateByField.get(fieldKey);
+    if (candidate) navigateToPage(candidate.page_number);
+  };
+  const selectedFieldResult = detail?.results.find((item) => item.field_key === selectedFieldKey);
+  const selectedFieldCandidate = selectedFieldKey
+    ? bestCandidateByField.get(selectedFieldKey) ?? selectedCandidateByField.get(selectedFieldKey)
+    : undefined;
+  const selectedEvidencePage = selectedFieldCandidate?.page_number ?? selectedFieldResult?.page_number;
+  const selectedEvidenceBox = selectedFieldCandidate?.bounding_box ?? (
+    selectedFieldResult?.page_number === selectedEvidencePage ? selectedFieldResult?.bbox : undefined
+  );
+  const selectedEvidenceConfidence =
+    selectedFieldCandidate?.ocr_confidence ?? selectedFieldResult?.confidence;
   const saveResult = async (result: Result, value: string) => {
     if (!detail || value.trim() === (result.value ?? "")) return;
     try {
@@ -290,8 +397,17 @@ export default function App() {
       <header>
         <div className="header-side header-left">
         <div className="brand">
-          <ScanText />
           <strong>Mnemos</strong>
+          <button
+            type="button"
+            className="settings-trigger"
+            onClick={() => void openSettings()}
+            disabled={isProcessing || batchIsProcessing}
+            title="Campi e regole della pipeline"
+            aria-label="Apri impostazioni dei campi e delle regole"
+          >
+            <Settings size={17} />
+          </button>
         </div>
         {detail && (
           <div className="header-document">
@@ -340,11 +456,11 @@ export default function App() {
           <small>{isProcessing ? "analisi" : "tempo"}</small>
         </div>
         <div className="header-side header-actions">
-          {detail && (
+          {detail && canReset && (
             <button
               className="reset-all-button"
               onClick={() => void resetEverything()}
-              disabled={isProcessing || busy}
+              disabled={busy}
               title="Cancella elaborazione e file derivati, mantenendo il PDF originale"
               aria-label="Resetta tutto"
             >
@@ -362,19 +478,25 @@ export default function App() {
             <Upload size={17} />
             <span>Carica</span>
           </button>
-          {detail && (
+          {detail && (isProcessing ? (
             <button
-              className={`primary analyze-button${isProcessing ? " analyzing" : ""}`}
-              onClick={process}
-              disabled={busy || isProcessing}
-              aria-label={isProcessing ? "Analisi in corso" : "Analizza documento"}
+              className="primary analyze-button interrupt-button"
+              onClick={() => void interrupt()}
+              disabled={busy || interruptRequested}
+              aria-label={interruptRequested ? "Interruzione richiesta" : "Interrompi analisi"}
+              title="Interrompi al prossimo checkpoint sicuro"
             >
-              {isProcessing ? (
-                <>
-                  <LoaderCircle className="spin" size={17} />
-                  <span className="analyze-label">Analisi in corso</span>
-                </>
-              ) : detail.status === "COMPLETED" || detail.status === "FAILED" ? (
+              <X size={17} />
+              <span className="analyze-label">{interruptRequested ? "Interruzione…" : "Interrompi"}</span>
+            </button>
+          ) : (
+            <button
+              className="primary analyze-button"
+              onClick={process}
+              disabled={busy}
+              aria-label="Analizza documento"
+            >
+              {detail.status === "COMPLETED" || detail.status === "FAILED" || detail.status === "CANCELLED" ? (
                 <>
                   <RotateCcw size={16} />
                   <span className="analyze-label">Riprova</span>
@@ -386,7 +508,7 @@ export default function App() {
                 </>
               )}
             </button>
-          )}
+          ))}
         </div>
         <input
           ref={input}
@@ -418,50 +540,64 @@ export default function App() {
                 <span>{fields.length}</span>
               </div>
               <div className="fields-scroll">
-                {pendingFields.length > 0 && (
+                {showAnalysisPrompt ? (
+                  <div className="column-empty analysis-prompt">
+                    <ScanText size={24} />
+                    <strong>Nessun dato disponibile</strong>
+                    <span>Avvia un’analisi del fascicolo per estrarre campi e contenuti.</span>
+                  </div>
+                ) : pendingFields.length > 0 && (
                   <section className="pending-fields" aria-label="Campi in attesa">
                     <div className="pending-heading">
                       <span>In attesa</span>
                       <small>{pendingFields.length}</small>
                     </div>
                     {pendingFields.map((field) => (
-                      <div className="pending-field" key={field.key}>
-                        <div>
-                          <strong>{field.label}</strong>
-                          <small>{isProcessing ? "Estrazione in corso" : "Nessun valore"}</small>
+                      <div
+                        className={`pending-field${selectedFieldKey === field.key ? " active" : ""}`}
+                        key={field.key}
+                      >
+                        <button
+                          type="button"
+                          className="pending-field-select"
+                          onClick={() => chooseField(field.key)}
+                        >
+                          <small>{field.label}</small>
+                          <strong className={valueChosenByAI(field.key) ? "has-ai-value" : ""}>
+                            {valueChosenByAI(field.key) ||
+                              (isProcessing ? "In attesa della selezione AI" : "Nessun valore")}
+                          </strong>
+                        </button>
+                        <div className="pending-field-actions">
                           <button
                             type="button"
                             className="candidate-count-button"
                             disabled={!candidatesByField.get(field.key)?.length}
-                            onClick={() => setCandidateField(field)}
+                            onClick={() => {
+                              chooseField(field.key);
+                              setCandidateField(field);
+                            }}
                           >
                             {candidatesByField.get(field.key)?.length ?? 0} candidati
                           </button>
                         </div>
-                        <button
-                          type="button"
-                          className="rules-button"
-                          onClick={() => setRulesField(field)}
-                          aria-label={`Mostra le regole di estrazione per ${field.label}`}
-                        >
-                          <BookOpenText size={14} /> Regole
-                        </button>
                       </div>
                     ))}
                   </section>
                 )}
-                {orderedResults.length ? (
+                {!showAnalysisPrompt && orderedResults.length ? (
                   <div className="results-list">
                     {orderedResults.map((result, index) => (
                     <div
                       key={result.field_key}
-                      className={`result${result.field_key === selectedResult?.field_key ? " active" : ""}${result.confidence < 0.9 ? " low-confidence" : ""}`}
+                      className={`result${result.field_key === selectedFieldKey ? " active" : ""}${result.confidence < 0.9 ? " low-confidence" : ""}`}
                       onClick={() => chooseResult(result)}
                     >
                       <div>
                         <small>{fieldLabel(result.field_key, fields)}</small>
                         {result.field_key === "sintesi" ? (
                           <textarea
+                            key={`${result.field_key}:${result.value ?? ""}`}
                             className="result-value-input summary-value"
                             maxLength={100}
                             defaultValue={result.value || ""}
@@ -475,6 +611,7 @@ export default function App() {
                           />
                         ) : (
                           <input
+                            key={`${result.field_key}:${result.value ?? ""}`}
                             className="result-value-input"
                             defaultValue={result.value || ""}
                             placeholder="In attesa dell’analisi"
@@ -567,57 +704,20 @@ export default function App() {
                   totalPages={detail.page_count}
                   onPageChange={setPageNumber}
                   reviewBox={
-                    viewerTab === "optimized" && selectedResult?.page_number === (pageNumber ?? 1)
-                      ? selectedResult.bbox
+                    viewerTab === "optimized" && selectedEvidencePage === (pageNumber ?? 1)
+                      ? selectedEvidenceBox
                       : undefined
                   }
-                  reviewLabel={selectedResult?.field_key}
-                  reviewConfidence={selectedResult?.confidence}
+                  reviewLabel={selectedFieldKey}
+                  reviewConfidence={selectedEvidenceConfidence}
                 />
               </div>
             </section>
 
-            <PipelineLog detail={detail} memory={memory} />
+            <PipelineLog detail={detail} memory={memory} showAnalysisPrompt={showAnalysisPrompt} />
           </div>
         )}
       </main>
-      {rulesField && (
-        <div className="rules-dialog-backdrop" onMouseDown={(event) => {
-          if (event.target === event.currentTarget) setRulesField(undefined);
-        }}>
-          <section
-            className="rules-dialog"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="rules-dialog-title"
-            onKeyDown={(event) => {
-              if (event.key === "Escape") setRulesField(undefined);
-            }}
-          >
-            <div className="rules-dialog-heading">
-              <div>
-                <span>Regole di estrazione</span>
-                <h2 id="rules-dialog-title">{rulesField.label}</h2>
-              </div>
-              <button ref={rulesCloseRef} type="button" className="rules-close" onClick={() => setRulesField(undefined)} aria-label="Chiudi dialog">
-                <X size={18} />
-              </button>
-            </div>
-            <div className="rules-dialog-content">
-              <p>{rulesField.instructions || "Nessuna istruzione specifica configurata."}</p>
-              <RuleList title="Parole chiave" values={rulesField.strategy.keywords} empty="Nessuna parola chiave configurata." />
-              <RuleList title="Ruoli ammessi" values={rulesField.strategy.allowed_roles} empty="Nessun ruolo specificato." />
-              <RuleList title="Regole di priorità" values={rulesField.ranking_rules.map((rule) => JSON.stringify(rule))} empty="Nessuna regola di priorità configurata." />
-              <RuleList title="Esempi positivi" values={rulesField.positive_examples} empty="Nessun esempio configurato." />
-              <RuleList title="Esempi da escludere" values={rulesField.negative_examples} empty="Nessun esempio configurato." />
-              <div className="rule-detail">
-                <strong>Validazione</strong>
-                <code>{JSON.stringify({ pattern: rulesField.strategy.pattern ?? rulesField.validator.pattern, tipo: rulesField.strategy.type, profilo: rulesField.strategy.profile, ruolo_candidato: rulesField.strategy.candidate_role }, null, 2)}</code>
-              </div>
-            </div>
-          </section>
-        </div>
-      )}
       {candidateField && (
         <div className="rules-dialog-backdrop" onMouseDown={(event) => {
           if (event.target === event.currentTarget) setCandidateField(undefined);
@@ -633,57 +733,87 @@ export default function App() {
                 <span>Candidati estratti · {candidatesByField.get(candidateField.key)?.length ?? 0}</span>
                 <h2 id="candidate-dialog-title">{candidateField.label}</h2>
               </div>
-              <button ref={rulesCloseRef} type="button" className="rules-close" onClick={() => setCandidateField(undefined)} aria-label="Chiudi dialog">
+              <button ref={candidateCloseRef} type="button" className="rules-close" onClick={() => setCandidateField(undefined)} aria-label="Chiudi dialog">
                 <X size={18} />
               </button>
             </div>
             <div className="rules-dialog-content candidate-list">
-              {(candidatesByField.get(candidateField.key) ?? []).length ? (
-                (candidatesByField.get(candidateField.key) ?? []).map((candidate, index) => {
-                  const resolved = memory?.resolved_fields.find((item) => item.field_key === candidateField.key);
-                  const selected = resolved
-                    ? resolved.selected_candidate_id === candidate.id
+              {(() => {
+                const fieldCandidates = candidatesByField.get(candidateField.key) ?? [];
+                const resolved = memory?.resolved_fields.find((item) => item.field_key === candidateField.key);
+                const selectedId = resolved?.selected_candidate_id;
+                const orderedCandidates = [...fieldCandidates].sort((left, right) => {
+                  return right.ocr_confidence - left.ocr_confidence ||
+                    right.vision_confidence - left.vision_confidence ||
+                    right.semantic_confidence - left.semantic_confidence ||
+                    left.id - right.id;
+                });
+                return orderedCandidates.length ? orderedCandidates.map((candidate, index) => {
+                  const selected = selectedId
+                    ? selectedId === candidate.id
                     : candidate.selected;
                   return (
-                    <article className={`candidate-option${selected ? " selected" : ""}`} key={candidate.id}>
-                      <div className="candidate-option-heading">
-                        <strong>#{index + 1} · {candidate.raw_value}</strong>
-                        {selected && <span className="candidate-selected-badge">Selezionato</span>}
+                    <details className={`candidate-option${selected ? " selected" : ""}`} key={candidate.id} open={selected || index === 0}>
+                      <summary className="candidate-option-summary">
+                        <div className="candidate-option-heading">
+                          <strong>#{index + 1} · {candidate.raw_value}</strong>
+                          <span className="candidate-badges">
+                            {index === 0 && <span className="candidate-top-badge">OCR più alta</span>}
+                            {selected && <span className="candidate-selected-badge">Scelto</span>}
+                          </span>
+                        </div>
+                        <div className="candidate-meta">
+                          <span>Pag. {candidate.page_number}</span>
+                          {candidate.semantic_role && <span>{candidate.semantic_role}</span>}
+                        </div>
+                        <span className="candidate-summary-relevance">
+                          Rilevanza {Math.round(candidate.global_relevance * 100)}%
+                        </span>
+                      </summary>
+                      <div className="candidate-expanded">
+                        <div className="candidate-relevance-tile">
+                          <span>Rilevanza effettiva</span>
+                          <strong>{Math.round(candidate.global_relevance * 100)}%</strong>
+                          <small>
+                            {candidate.relevance_source === "global_cluster"
+                              ? "Punteggio globale del gruppo, con riscontri e relazioni tra campi."
+                              : "Punteggio del candidato: 75% semantica e 25% OCR."}
+                          </small>
+                        </div>
+                        <div className="candidate-score-details">
+                          <span>Semantica {Math.round(candidate.semantic_confidence * 100)}%</span>
+                          <span>OCR {Math.round(candidate.ocr_confidence * 100)}%</span>
+                          <span>Visione {Math.round(candidate.vision_confidence * 100)}%</span>
+                        </div>
+                        {candidate.evidence_text && <p>{candidate.evidence_text}</p>}
+                        <button
+                          type="button"
+                          className="candidate-select-button"
+                          disabled={isProcessing || savingCandidateId !== undefined || selected}
+                          onClick={() => void chooseCandidate(candidateField, candidate.id, candidate.raw_value)}
+                        >
+                          {savingCandidateId === candidate.id ? "Salvataggio…" : selected ? "Candidato selezionato" : "Scegli questo candidato"}
+                        </button>
                       </div>
-                      <div className="candidate-meta">
-                        <span>Pag. {candidate.page_number}</span>
-                        <span>{Math.round(candidate.semantic_confidence * 100)}% confidenza</span>
-                        {candidate.semantic_role && <span>{candidate.semantic_role}</span>}
-                      </div>
-                      {candidate.evidence_text && <p>{candidate.evidence_text}</p>}
-                      <button
-                        type="button"
-                        className="candidate-select-button"
-                        disabled={isProcessing || savingCandidateId !== undefined || selected}
-                        onClick={() => void chooseCandidate(candidateField, candidate.id, candidate.raw_value)}
-                      >
-                        {savingCandidateId === candidate.id ? "Salvataggio…" : selected ? "Selezionato" : "Sostituisci con questo"}
-                      </button>
-                    </article>
+                    </details>
                   );
-                })
-              ) : (
+                }) : (
                 <div className="candidate-empty">Nessun candidato disponibile per questo campo.</div>
-              )}
+                );
+              })()}
             </div>
           </section>
         </div>
       )}
-    </div>
-  );
-}
-
-function RuleList({ title, values, empty }: { title: string; values: unknown; empty: string }) {
-  const items = Array.isArray(values) ? values.filter((value): value is string => typeof value === "string" && Boolean(value.trim())) : [];
-  return (
-    <div className="rule-detail">
-      <strong>{title}</strong>
-      {items.length ? <ul>{items.map((item) => <li key={item}>{item}</li>)}</ul> : <span>{empty}</span>}
+      {settingsOpen && (
+        <SettingsDialog
+          fields={settingsFields}
+          saving={settingsSaving}
+          error={settingsError}
+          onClose={() => setSettingsOpen(false)}
+          onSave={(updatedFields) => void saveSettings(updatedFields)}
+        />
+      )}
     </div>
   );
 }

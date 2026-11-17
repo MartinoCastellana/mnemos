@@ -10,8 +10,6 @@ import {
 import type * as PdfJs from "pdfjs-dist";
 import { fieldLabel } from "../lib/fields";
 
-let sharedPdfWorker: Worker | undefined;
-
 export function PageViewer({
   documentUrl,
   currentPage,
@@ -45,20 +43,20 @@ export function PageViewer({
     setError("");
     setPdf(undefined);
     let loadingTask: PdfJs.PDFDocumentLoadingTask | undefined;
+    let pdfWorker: Worker | undefined;
     void Promise.all([
       import("pdfjs-dist"),
       import("pdfjs-dist/build/pdf.worker.min.mjs?worker&inline"),
     ])
       .then(([pdfjs, workerModule]) => {
         if (!active) return;
-        if (!sharedPdfWorker) sharedPdfWorker = new workerModule.default();
-        pdfjs.GlobalWorkerOptions.workerPort = sharedPdfWorker;
+        pdfWorker = new workerModule.default();
+        pdfjs.GlobalWorkerOptions.workerPort = pdfWorker;
         loadingTask = pdfjs.getDocument({ url: documentUrl });
         return loadingTask.promise;
       })
       .then((loaded) => {
         if (loaded && active) setPdf(loaded);
-        else if (loaded) void loaded.destroy();
       })
       .catch((reason: unknown) => {
         if (active) {
@@ -68,7 +66,18 @@ export function PageViewer({
       });
     return () => {
       active = false;
-      void loadingTask?.destroy();
+      renderTaskRef.current?.cancel();
+      if (loadingTask) {
+        void (async () => {
+          try {
+            await loadingTask?.destroy();
+          } catch {
+            // The loading task may already have completed while the viewer unmounts.
+          }
+        })();
+      } else {
+        pdfWorker?.terminate();
+      }
     };
   }, [documentUrl]);
 

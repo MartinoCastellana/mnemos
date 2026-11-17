@@ -4,7 +4,8 @@ from pathlib import Path
 from threading import Lock
 import time
 
-import cv2
+import httpx
+
 import fitz
 import pytesseract
 from PIL import Image
@@ -23,10 +24,11 @@ class RenderingService:
 
 
 def optimize_pdf(pdf_path: str) -> tuple[str, int, dict]:
-    """Normalize page orientation, binarize for OCR, and rasterize at 120 DPI."""
+    """Normalize page orientation and rasterize in color at 120 DPI."""
     source = Path(pdf_path)
     optimized = source.with_name("optimized.pdf")
     dpi = 120
+    orientation_dpi = 240
     orientation_confidence_threshold = 12.0
     page_rotations: list[dict] = []
     metadata_rotated_pages = 0
@@ -41,14 +43,22 @@ def optimize_pdf(pdf_path: str) -> tuple[str, int, dict]:
                 page.remove_rotation()
                 metadata_rotated_pages += 1
 
-            pixmap = page.get_pixmap(dpi=dpi, colorspace=fitz.csGRAY, alpha=False)
-            image = Image.frombytes("L", (pixmap.width, pixmap.height), pixmap.samples)
+            orientation_pixmap = page.get_pixmap(
+                dpi=orientation_dpi, colorspace=fitz.csGRAY, alpha=False
+            )
+            orientation_image = Image.frombytes(
+                "L", (orientation_pixmap.width, orientation_pixmap.height), orientation_pixmap.samples
+            )
+            pixmap = page.get_pixmap(dpi=dpi, colorspace=fitz.csRGB, alpha=False)
+            image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
             detected_rotation = 0
             orientation_confidence = 0.0
             orientation_status = "uncertain"
             try:
                 orientation = pytesseract.image_to_osd(
-                    image, output_type=pytesseract.Output.DICT, config="--psm 0"
+                    orientation_image,
+                    output_type=pytesseract.Output.DICT,
+                    config="--psm 0",
                 )
                 orientation_confidence = float(orientation.get("orientation_conf", 0) or 0)
                 proposed_rotation = int(orientation.get("rotate", 0) or 0) % 360
@@ -65,11 +75,6 @@ def optimize_pdf(pdf_path: str) -> tuple[str, int, dict]:
                 image = image.rotate(-detected_rotation, expand=True)
                 orientation_rotated_pages += 1
 
-            grayscale = np.asarray(image, dtype=np.uint8)
-            threshold, binary = cv2.threshold(
-                grayscale, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU
-            )
-            image = Image.fromarray(binary)
             buffer = BytesIO()
             image.save(buffer, format="PNG", optimize=True, compress_level=9)
             output_page = result.new_page(
@@ -84,7 +89,6 @@ def optimize_pdf(pdf_path: str) -> tuple[str, int, dict]:
                     "detected_rotation": detected_rotation,
                     "orientation_confidence": round(orientation_confidence, 2),
                     "orientation_status": orientation_status,
-                    "binarization_threshold": int(threshold),
                 }
             )
         result.save(optimized, garbage=4, deflate=True, clean=True)
@@ -97,7 +101,8 @@ def optimize_pdf(pdf_path: str) -> tuple[str, int, dict]:
         "source_bytes": source.stat().st_size,
         "optimized_bytes": optimized.stat().st_size,
         "dpi": dpi,
-        "color_mode": "black_and_white_otsu",
+        "orientation_detection_dpi": orientation_dpi,
+        "color_mode": "rgb",
         "rotated_pages": rotated_pages,
         "metadata_rotated_pages": metadata_rotated_pages,
         "orientation_rotated_pages": orientation_rotated_pages,
@@ -196,6 +201,37 @@ class MiniCPMOCRService:
             self.settings.minicpm_layout_threshold,
         )
         self.last_metrics: dict = {}
+
+    def wait_until_standby(self, timeout_sec: int) -> dict:
+        """Wait until llama.cpp confirms its model and inference memory are asleep."""
+        started = time.perf_counter()
+        deadline = time.monotonic() + timeout_sec
+        last_error = None
+        while time.monotonic() < deadline:
+            try:
+                response = httpx.get(f"{self.client.server_url.rstrip('/')}/props", timeout=5)
+                response.raise_for_status()
+                payload = response.json()
+                sleeping = (
+                    payload.get("is_sleeping", payload.get("sleeping"))
+                    if isinstance(payload, dict)
+                    else None
+                )
+                if sleeping is True:
+                    return {
+                        "standby": True,
+                        "wait_ms": round((time.perf_counter() - started) * 1000),
+                        "endpoint": f"{self.client.server_url.rstrip('/')}/props",
+                    }
+                last_error = "llama-server does not report sleeping=true in /props"
+            except (httpx.HTTPError, ValueError) as exc:
+                last_error = str(exc)
+            time.sleep(1)
+        raise RuntimeError(
+            "MiniCPM did not enter standby before the Qwen phase. "
+            "Restart llama-server with --sleep-idle-seconds enabled; "
+            f"last status: {last_error or 'timeout'}"
+        )
 
     def extract(self, page: fitz.Page) -> tuple[str, list[OCRBlock]]:
         started = time.perf_counter()
